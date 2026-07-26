@@ -6,7 +6,7 @@ const express = require("express");
 
 const request = require("./src/lib/request");
 const response = require("./src/lib/response");
-const routes = require("./src/routes");
+const routes = require("./src/routes/routes");
 
 const app = express();
 const port = Number(process.env.PORT || 3000);

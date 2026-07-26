@@ -2,22 +2,36 @@
 
 const jwt = require("./jwt");
 
-module.exports = function (req, res, next) {
-  const token = req.getToken();
-
-  if (!token) {
-    return res.noToken();
-  }
-
+module.exports = function authentication(req, res, next) {
   try {
+    const authorization = req.headers.authorization;
+
+    if (!authorization?.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Access token tidak ditemukan",
+      });
+    }
+
+    const token = authorization.slice(7).trim();
     const payload = jwt.verifyAccessToken(token);
 
     req.setUser(payload);
 
     return next();
-  } catch (err) {
-    console.error("Access token verification failed:", err.message);
+  } catch (error) {
+    if (error.name === "TokenExpiredError") {
+      return res.status(401).json({
+        success: false,
+        message: "Access token sudah kedaluwarsa",
+        code: "TOKEN_EXPIRED",
+      });
+    }
 
-    return res.invalidToken();
+    return res.status(401).json({
+      success: false,
+      message: "Access token tidak valid",
+      code: "INVALID_TOKEN",
+    });
   }
 };
