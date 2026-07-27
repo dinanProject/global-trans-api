@@ -1,13 +1,11 @@
 ---
 deployment:
   tasks:
-    - export DEPLOYPATH=/DATA/u3868672/global-trans-api
-    - /bin/mkdir -p "$DEPLOYPATH"
-    - /bin/mkdir -p "$DEPLOYPATH/tmp"
-    - /bin/rm -rf "$DEPLOYPATH/src"
-    - /bin/cp -R src "$DEPLOYPATH/src"
-    - /bin/cp app.js "$DEPLOYPATH/app.js"
-    - /bin/cp config.js "$DEPLOYPATH/config.js"
-    - /bin/cp package.json "$DEPLOYPATH/package.json"
-    - /bin/cp package-lock.json "$DEPLOYPATH/package-lock.json"
-    - /bin/touch "$DEPLOYPATH/tmp/restart.txt"
+    - /bin/mkdir -p /DATA/u3868672/global-trans-api/tmp
+    - /bin/cp app.js /DATA/u3868672/global-trans-api/app.js
+    - /bin/cp config.js /DATA/u3868672/global-trans-api/config.js
+    - /bin/cp package.json /DATA/u3868672/global-trans-api/package.json
+    - /bin/cp package-lock.json /DATA/u3868672/global-trans-api/package-lock.json
+    - /bin/rm -rf /DATA/u3868672/global-trans-api/src
+    - /bin/cp -R src /DATA/u3868672/global-trans-api/src
+    - /bin/touch /DATA/u3868672/global-trans-api/tmp/restart.txt
