@@ -9,6 +9,8 @@ const db = require("../../lib/db")();
 const jwt = require("../../lib/jwt");
 const authentication = require("../../lib/authentication");
 const tokenHelper = require("../../lib/token");
+const { getUserAccess } = require("../../lib/user-access");
+const { getUserMenus } = require("../../lib/user-menu");
 
 route
   .post("/login", async (req, res, next) => {
@@ -37,7 +39,6 @@ route
         return res.unauthenticated("Invalid email or password.");
       }
 
-      // Revoke semua refresh token aktif..penting
       await db("refreshTokens")
         .where({
           userId: user.id,
@@ -55,36 +56,49 @@ route
 
       const refreshToken = jwt.signRefreshToken({
         userId: user.id,
-
         uuid: user.uuid,
       });
 
       const refreshPayload = jwt.verifyRefreshToken(refreshToken);
-      const refreshTokenHash = tokenHelper.hash(refreshToken);
-      const refreshTokenExpiresAt = new Date(refreshPayload.exp * 1000);
 
       await db("refreshTokens").insert({
         uuid: crypto.randomUUID(),
         jti: refreshPayload.jti,
         userId: user.id,
-        tokenHash: refreshTokenHash,
+        tokenHash: tokenHelper.hash(refreshToken),
         ipAddress: req.ip || null,
         userAgent: req.get("user-agent") || null,
         expiresAt: new Date(refreshPayload.exp * 1000),
       });
 
-      console.log({
-        refreshTokenHash,
-        refreshTokenExpiresAt,
-        jti: refreshPayload.jti,
+      await db("users").where("id", user.id).update({
+        lastLoginAt: new Date(),
+        updatedAt: new Date(),
       });
 
-      delete user.password;
+      const access = await getUserAccess(user.id);
+      const menus = await getUserMenus(user.id);
+
+      if (!access) {
+        return res.unauthenticated(
+          "User access information could not be loaded.",
+        );
+      }
 
       return res.success({
         accessToken,
         refreshToken,
-        user,
+
+        user: access.user,
+        company: access.company,
+        division: access.division,
+
+        roles: access.roles,
+        permissions: access.permissions,
+        roleCodes: access.roleCodes,
+        permissionCodes: access.permissionCodes,
+
+        menus,
       });
     } catch (err) {
       next(err);
@@ -107,8 +121,38 @@ route
     }
   })
 
-  .get("/me", authentication, function (req, res) {
-    return res.success(req.getUser());
+  .get("/me", authentication, async function (req, res, next) {
+    try {
+      const authenticatedUser = req.getUser();
+
+      const userId = authenticatedUser?.userId ?? authenticatedUser?.id;
+
+      if (!userId) {
+        return res.unauthenticated();
+      }
+
+      const access = await getUserAccess(userId);
+      const menus = await getUserMenus(userId);
+
+      if (!access) {
+        return res.unauthenticated("User is inactive or no longer available.");
+      }
+
+      return res.success({
+        user: access.user,
+        company: access.company,
+        division: access.division,
+
+        roles: access.roles,
+        permissions: access.permissions,
+        roleCodes: access.roleCodes,
+        permissionCodes: access.permissionCodes,
+
+        menus,
+      });
+    } catch (err) {
+      next(err);
+    }
   })
 
   .post("/refresh-token", async function (req, res, next) {
@@ -274,4 +318,5 @@ route
       next(err);
     }
   });
+
 module.exports = route;

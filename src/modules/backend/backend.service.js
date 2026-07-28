@@ -84,10 +84,16 @@ async function getBootstrap(authUser) {
     .orderBy("sequence", "asc")
     .orderBy("menuId", "asc");
 
+  const menus = buildMenuTree(menuRows);
+
   return {
     user,
-    menus: buildMenuTree(menuRows),
+    menus,
   };
+  // return {
+  //   user,
+  //   menus: buildMenuTree(menuRows),
+  // };
 }
 
 module.exports = {
