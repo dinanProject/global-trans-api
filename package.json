@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node app.js",
-    "dev": "nodemon app.js",
+    "local": "nodemon app.js",
     "migrate": "knex migrate:latest",
     "migrate:rollback": "knex migrate:rollback",
     "seed": "knex seed:run"
@@ -24,7 +24,9 @@
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "knex": "^3.3.0",
+    "multer": "^2.2.0",
     "mysql2": "^3.23.1",
+    "nodemailer": "^9.0.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
