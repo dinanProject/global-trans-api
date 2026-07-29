@@ -10,7 +10,76 @@ const router = express.Router();
 router.use(authentication);
 
 router
+  .get("/", async (req, res, next) => {
+    try {
+      const roles = await db("roles as r")
+        .leftJoin("rolePermissions as rp", "rp.roleId", "r.id")
 
+        .leftJoin("userRoles as ur", "ur.roleId", "r.id")
+
+        .select([
+          "r.uuid",
+
+          "r.code",
+
+          "r.name",
+
+          "r.description",
+
+          "r.isSystem",
+
+          "r.isActive",
+        ])
+
+        .countDistinct({
+          permissionCount: "rp.permissionId",
+        })
+
+        .countDistinct({
+          userCount: "ur.userId",
+        })
+
+        .groupBy([
+          "r.id",
+
+          "r.uuid",
+
+          "r.code",
+
+          "r.name",
+
+          "r.description",
+
+          "r.isSystem",
+
+          "r.isActive",
+        ])
+
+        .orderBy("r.name", "asc");
+
+      return res.success(
+        roles.map((role) => ({
+          uuid: role.uuid,
+
+          code: role.code,
+
+          name: role.name,
+
+          description: role.description,
+
+          isSystem: Boolean(role.isSystem),
+
+          isActive: Boolean(role.isActive),
+
+          permissionCount: Number(role.permissionCount || 0),
+
+          userCount: Number(role.userCount || 0),
+        })),
+      );
+    } catch (error) {
+      return next(error);
+    }
+  })
   /**
    * GET /role-permission/:roleUuid
    */
