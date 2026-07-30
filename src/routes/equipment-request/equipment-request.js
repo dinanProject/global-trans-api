@@ -236,6 +236,32 @@ router
     }
   })
 
+  .get("/request-statuses", async (req, res) => {
+    try {
+      const statuses = await db("equipmentRequestStatuses")
+        .select(
+          "id",
+          "uuid",
+          "code",
+          "name",
+          "description",
+          "stage",
+          "sortOrder",
+          "allowEdit",
+          "isTerminal",
+          "isActive",
+        )
+        .where("isActive", 1)
+        .orderBy("sortOrder", "asc");
+
+      return res.success(statuses);
+    } catch (error) {
+      return res.err(
+        500,
+        error.message || "Failed to retrieve request statuses",
+      );
+    }
+  })
   /**
    * GET /equipment-request/:uuid
    */
