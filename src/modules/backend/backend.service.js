@@ -59,9 +59,16 @@ async function getBootstrap(authUser) {
     .join("userRoles as ur", "ur.roleId", "rp.roleId")
     .where("ur.userId", authUser.userId);
 
-  const permissionIds = permissionRows.map((item) => item.permissionId);
+  const permissionIds = new Set(
+    permissionRows.map((item) => String(item.permissionId)),
+  );
 
-  const menuRows = await db("menus")
+  /*
+   * Ambil seluruh menu aktif terlebih dahulu.
+   * Setelah itu baru filter berdasarkan permission user
+   * dan sertakan parent dari menu yang diizinkan.
+   */
+  const allMenuRows = await db("menus")
     .select([
       "menuId",
       "uuid",
@@ -74,26 +81,64 @@ async function getBootstrap(authUser) {
       "sequence",
     ])
     .where("isActive", true)
-    .where((builder) => {
-      builder.whereNull("permissionId");
-
-      if (permissionIds.length > 0) {
-        builder.orWhereIn("permissionId", permissionIds);
-      }
-    })
     .orderBy("sequence", "asc")
     .orderBy("menuId", "asc");
 
-  const menus = buildMenuTree(menuRows);
+  const menuById = new Map(
+    allMenuRows.map((menu) => [String(menu.menuId), menu]),
+  );
 
+  const allowedMenuIds = new Set();
+
+  function addMenuAndParents(menu) {
+    let currentMenu = menu;
+
+    while (currentMenu) {
+      const currentMenuId = String(currentMenu.menuId);
+
+      if (allowedMenuIds.has(currentMenuId)) {
+        break;
+      }
+
+      allowedMenuIds.add(currentMenuId);
+
+      if (!currentMenu.parentId) {
+        break;
+      }
+
+      currentMenu = menuById.get(String(currentMenu.parentId));
+    }
+  }
+
+  for (const menu of allMenuRows) {
+    const hasPermission =
+      menu.permissionId !== null &&
+      permissionIds.has(String(menu.permissionId));
+
+    /*
+     * Menu root tanpa permission yang mempunyai route dianggap public,
+     * misalnya Dashboard.
+     *
+     * Parent/container tanpa permission seperti Organization dan
+     * Administration tidak otomatis ditampilkan.
+     */
+    const isPublicRootMenu =
+      menu.permissionId === null && !menu.parentId && Boolean(menu.route);
+
+    if (hasPermission || isPublicRootMenu) {
+      addMenuAndParents(menu);
+    }
+  }
+
+  const menuRows = allMenuRows.filter((menu) =>
+    allowedMenuIds.has(String(menu.menuId)),
+  );
+
+  const menus = buildMenuTree(menuRows);
   return {
     user,
     menus,
   };
-  // return {
-  //   user,
-  //   menus: buildMenuTree(menuRows),
-  // };
 }
 
 module.exports = {
