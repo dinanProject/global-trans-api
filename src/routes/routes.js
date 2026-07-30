@@ -4,7 +4,10 @@ const express = require("express");
 const route = express.Router();
 
 route.use("/auth", require("../modules/auth/auth.routes"));
-route.use("/backend", require("../modules/backend/backend.routes"));
+route.use(
+  "/user-session",
+  require("../modules/user-session/user-session.routes"),
+);
 route.use("/user-role", require("./administration/user-role"));
 route.use("/role", require("./administration/role"));
 route.use("/permission", require("./administration/permission"));
