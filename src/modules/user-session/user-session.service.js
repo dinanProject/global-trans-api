@@ -1,6 +1,7 @@
 "use strict";
 
 const db = require("../../lib/db")();
+const { getUserAccess } = require("../../lib/user-access");
 
 function buildMenuTree(rows) {
   const menuMap = new Map();
@@ -34,25 +35,14 @@ function buildMenuTree(rows) {
   return roots;
 }
 
-async function getBootstrap(authUser) {
-  const user = await db("users")
-    .select([
-      "id as userId",
-      "uuid",
-      "companyId",
-      "divisionId",
-      "departmentId",
-      "email",
-      "fullName",
-      "phone",
-    ])
-    .where("id", authUser.userId)
-    .where("isActive", true)
-    .first();
+async function getUserSession(authUser) {
+  const userId = authUser?.userId ?? authUser?.id;
 
-  if (!user) {
-    throw new Error("User tidak ditemukan atau tidak aktif");
+  if (!userId) {
+    throw new Error("User ID tidak ditemukan");
   }
+
+  const access = await getUserAccess(userId); // ambil access role
 
   const permissionRows = await db("rolePermissions as rp")
     .distinct("rp.permissionId")
@@ -136,11 +126,13 @@ async function getBootstrap(authUser) {
 
   const menus = buildMenuTree(menuRows);
   return {
-    user,
+    user: access.user,
     menus,
+    roleCodes: access.roleCodes,
+    permissionCodes: access.permissionCodes,
   };
 }
 
 module.exports = {
-  getBootstrap,
+  getUserSession,
 };
