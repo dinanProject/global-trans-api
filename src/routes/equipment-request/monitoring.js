@@ -1261,16 +1261,111 @@ async function updateRequestStatusIfAvailable(trx, requestId, statusCode) {
     });
 }
 
+const MONITORING_ASSIGNMENT_STATUS_CODES = [
+  "ASSIGNED",
+  "IN_OPERATION",
+  "COMPLETED",
+];
+
+function normalizeDateOnly(value) {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function getTodayDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function calculateRemainingDays(plannedEndDate, actualEndDate = null) {
+  if (!plannedEndDate) {
+    return null;
+  }
+
+  const comparisonDate = actualEndDate
+    ? normalizeDateOnly(actualEndDate)
+    : getTodayDate();
+
+  if (!comparisonDate) {
+    return null;
+  }
+
+  const plannedEnd = new Date(`${plannedEndDate}T00:00:00Z`);
+  const currentDate = new Date(`${comparisonDate}T00:00:00Z`);
+
+  return Math.ceil(
+    (plannedEnd.getTime() - currentDate.getTime()) / (24 * 60 * 60 * 1000),
+  );
+}
+
+function calculateAssignmentMonitoring(assignment) {
+  const today = getTodayDate();
+  const plannedStartDate = normalizeDateOnly(assignment.plannedStartDate);
+  const plannedEndDate = normalizeDateOnly(assignment.plannedEndDate);
+  const actualStartDate = normalizeDateOnly(assignment.actualStartDate);
+  const actualEndDate = normalizeDateOnly(assignment.actualEndDate);
+
+  let operationStatus = "ASSIGNED";
+  let slaStatus = "ASSIGNED";
+
+  if (actualEndDate) {
+    operationStatus = "COMPLETED";
+    slaStatus =
+      plannedEndDate && actualEndDate <= plannedEndDate
+        ? "COMPLETED_ON_TIME"
+        : "COMPLETED_LATE";
+  } else if (actualStartDate) {
+    operationStatus = "RUNNING";
+
+    if (plannedEndDate && today > plannedEndDate) {
+      slaStatus = "OVERDUE";
+    } else if (plannedStartDate && actualStartDate > plannedStartDate) {
+      slaStatus = "LATE_START";
+    } else {
+      slaStatus = "ON_TIME_START";
+    }
+  } else if (plannedEndDate && today > plannedEndDate) {
+    operationStatus = "ASSIGNED";
+    slaStatus = "OVERDUE";
+  }
+
+  return {
+    operationStatus,
+    slaStatus,
+    remainingDays: calculateRemainingDays(
+      plannedEndDate,
+      assignment.actualEndDate,
+    ),
+    isOverdue: slaStatus === "OVERDUE",
+    isLateStart: slaStatus === "LATE_START",
+    isCompletedToday: actualEndDate === today,
+  };
+}
+
 function normalizeMonitoringFilters(query = {}) {
   const startDate = query.startDate ? normalizeDate(query.startDate) : null;
   const endDate = query.endDate ? normalizeDate(query.endDate) : null;
 
   if (query.startDate && !startDate) {
-    return { valid: false, message: "Query startDate tidak valid." };
+    return {
+      valid: false,
+      message: "Query startDate tidak valid.",
+    };
   }
 
   if (query.endDate && !endDate) {
-    return { valid: false, message: "Query endDate tidak valid." };
+    return {
+      valid: false,
+      message: "Query endDate tidak valid.",
+    };
   }
 
   if (startDate && endDate && endDate < startDate) {
@@ -1280,22 +1375,41 @@ function normalizeMonitoringFilters(query = {}) {
     };
   }
 
+  let overdueOnly = false;
+
+  if (
+    query.overdueOnly !== null &&
+    query.overdueOnly !== undefined &&
+    query.overdueOnly !== ""
+  ) {
+    try {
+      overdueOnly = parseBooleanQuery(query.overdueOnly);
+    } catch (error) {
+      return {
+        valid: false,
+        message: error.message,
+      };
+    }
+  }
+
   return {
     valid: true,
+    search: normalizeNullableString(query.search),
     companyUuid: normalizeNullableString(query.companyUuid),
     divisionUuid: normalizeNullableString(query.divisionUuid),
+    equipmentUuid: normalizeNullableString(query.equipmentUuid),
+    status: normalizeNullableString(query.status)?.toUpperCase() || null,
     startDate,
     endDate,
+    overdueOnly,
   };
 }
+function applyMonitoringFilters(query, filters, aliases = {}) {
+  const assignmentAlias = aliases.assignment || "assignment";
+  const companyAlias = aliases.company || "company";
+  const divisionAlias = aliases.division || "division";
+  const equipmentAlias = aliases.equipment || "equipmentUnit";
 
-function applyMonitoringFilters(
-  query,
-  filters,
-  requestAlias = "request",
-  companyAlias = "company",
-  divisionAlias = "division",
-) {
   if (filters.companyUuid) {
     query.andWhere(`${companyAlias}.uuid`, filters.companyUuid);
   }
@@ -1304,15 +1418,60 @@ function applyMonitoringFilters(
     query.andWhere(`${divisionAlias}.uuid`, filters.divisionUuid);
   }
 
+  if (filters.equipmentUuid) {
+    query.andWhere(`${equipmentAlias}.uuid`, filters.equipmentUuid);
+  }
+
   if (filters.startDate) {
-    query.andWhere(`${requestAlias}.endDate`, ">=", filters.startDate);
+    query.andWhere(
+      `${assignmentAlias}.plannedEndDate`,
+      ">=",
+      filters.startDate,
+    );
   }
 
   if (filters.endDate) {
-    query.andWhere(`${requestAlias}.startDate`, "<=", filters.endDate);
+    query.andWhere(
+      `${assignmentAlias}.plannedStartDate`,
+      "<=",
+      filters.endDate,
+    );
   }
 }
 
+function buildMonitoringAssignmentQuery(trx = db) {
+  return trx("equipmentAssignments as assignment")
+    .join("equipmentRequests as request", "request.id", "assignment.requestId")
+    .join(
+      "equipmentRequestDetails as detail",
+      "detail.id",
+      "assignment.requestDetailId",
+    )
+    .join(
+      "equipmentUnits as equipmentUnit",
+      "equipmentUnit.id",
+      "assignment.equipmentUnitId",
+    )
+    .leftJoin("equipmentCategories as category", function () {
+      this.on("category.id", "=", "detail.equipmentCategoryId").andOnNull(
+        "category.deletedAt",
+      );
+    })
+    .leftJoin("companies as company", function () {
+      this.on("company.id", "=", "request.companyId").andOnNull(
+        "company.deletedAt",
+      );
+    })
+    .leftJoin("divisions as division", function () {
+      this.on("division.id", "=", "request.divisionId").andOnNull(
+        "division.deletedAt",
+      );
+    })
+    .whereNull("assignment.deletedAt")
+    .whereNull("request.deletedAt")
+    .where("assignment.isActive", true)
+    .whereIn("assignment.statusCode", MONITORING_ASSIGNMENT_STATUS_CODES);
+}
 /**
  * GET /equipment-request/monitoring/summary
  *
@@ -1334,75 +1493,81 @@ router.get(
         return res.incomplete(filters.message);
       }
 
-      const baseQuery = db("equipmentRequests as request")
-        .leftJoin("companies as company", "company.id", "request.companyId")
-        .leftJoin("divisions as division", "division.id", "request.divisionId")
-        .whereNull("request.deletedAt");
+      const query = buildMonitoringAssignmentQuery().select([
+        "assignment.id",
+        "assignment.statusCode",
+        "assignment.plannedStartDate",
+        "assignment.plannedEndDate",
+        "assignment.actualStartDate",
+        "assignment.actualEndDate",
+      ]);
 
-      applyRequestScope(baseQuery, access, "request");
-      applyMonitoringFilters(
-        baseQuery,
-        filters,
-        "request",
-        "company",
-        "division",
-      );
-
-      const statusRows = await baseQuery
-        .clone()
-        .select("request.status")
-        .count({ total: "request.id" })
-        .groupBy("request.status")
-        .orderBy("request.status", "asc");
-
-      const assignmentBase = db("equipmentAssignments as assignment")
-        .join(
-          "equipmentRequests as request",
-          "request.id",
-          "assignment.requestId",
-        )
-        .leftJoin("companies as company", "company.id", "request.companyId")
-        .leftJoin("divisions as division", "division.id", "request.divisionId")
-        .whereNull("assignment.deletedAt")
-        .whereNull("request.deletedAt");
-
-      applyRequestScope(assignmentBase, access, "request");
-      applyMonitoringFilters(
-        assignmentBase,
-        filters,
-        "request",
-        "company",
-        "division",
-      );
-
-      const assignmentRows = await assignmentBase
-        .clone()
-        .select("assignment.statusCode")
-        .count({ total: "assignment.id" })
-        .groupBy("assignment.statusCode")
-        .orderBy("assignment.statusCode", "asc");
-
-      const requestTotal = statusRows.reduce(
-        (total, row) => total + Number(row.total || 0),
-        0,
-      );
-      const assignmentTotal = assignmentRows.reduce(
-        (total, row) => total + Number(row.total || 0),
-        0,
-      );
-
-      return res.success({
-        requestTotal,
-        assignmentTotal,
-        requestsByStatus: statusRows.map((row) => ({
-          status: row.status,
-          total: Number(row.total || 0),
-        })),
-        assignmentsByStatus: assignmentRows.map((row) => ({
-          statusCode: row.statusCode,
-          total: Number(row.total || 0),
-        })),
+      applyRequestScope(query, access, "request");
+      applyMonitoringFilters(query, filters, {
+        assignment: "assignment",
+        company: "company",
+        division: "division",
+        equipment: "equipmentUnit",
       });
+
+      const assignments = await query;
+
+      const summary = {
+        activeOperation: 0,
+        assignedWaitingStart: 0,
+        overdue: 0,
+        lateStart: 0,
+        completedToday: 0,
+        availableUnit: 0,
+      };
+
+      assignments.forEach((assignment) => {
+        const monitoring = calculateAssignmentMonitoring(assignment);
+
+        if (assignment.actualStartDate && !assignment.actualEndDate) {
+          summary.activeOperation += 1;
+        }
+
+        if (!assignment.actualStartDate && !assignment.actualEndDate) {
+          summary.assignedWaitingStart += 1;
+        }
+
+        if (monitoring.isOverdue) {
+          summary.overdue += 1;
+        }
+
+        if (monitoring.isLateStart) {
+          summary.lateStart += 1;
+        }
+
+        if (monitoring.isCompletedToday) {
+          summary.completedToday += 1;
+        }
+      });
+
+      const availableUnitQuery = db("equipmentUnits as equipmentUnit")
+        .where("equipmentUnit.isActive", true)
+        .whereNull("equipmentUnit.deletedAt")
+        .whereNotExists(function () {
+          this.select(db.raw("1"))
+            .from("equipmentAssignments as activeAssignment")
+            .whereRaw("activeAssignment.equipmentUnitId = equipmentUnit.id")
+            .where("activeAssignment.isActive", true)
+            .whereNull("activeAssignment.deletedAt")
+            .whereNull("activeAssignment.actualEndDate")
+            .whereIn("activeAssignment.statusCode", [
+              "ASSIGNED",
+              "IN_OPERATION",
+            ]);
+        })
+        .count({ total: "equipmentUnit.id" })
+        .first();
+
+      const availableUnitResult = await availableUnitQuery;
+
+      summary.availableUnit = Number(availableUnitResult?.total || 0);
+
+      return res.success(summary);
     } catch (error) {
       console.error("GET /equipment-request/monitoring/summary error:", error);
 
@@ -1410,17 +1575,18 @@ router.get(
     }
   },
 );
-
 /**
  * GET /equipment-request/monitoring/assignments
  *
  * Query:
  * - search
- * - statusCode
  * - companyUuid
  * - divisionUuid
+ * - equipmentUuid
+ * - status
  * - startDate
  * - endDate
+ * - overdueOnly
  */
 router.get(
   "/assignments",
@@ -1434,90 +1600,118 @@ router.get(
         return res.incomplete(filters.message);
       }
 
-      const query = db("equipmentAssignments as assignment")
-        .join(
-          "equipmentRequests as request",
-          "request.id",
-          "assignment.requestId",
-        )
-        .join(
-          "equipmentRequestDetails as detail",
-          "detail.id",
-          "assignment.requestDetailId",
-        )
-        .join(
-          "equipmentUnits as equipmentUnit",
-          "equipmentUnit.id",
-          "assignment.equipmentUnitId",
-        )
-        .leftJoin("equipmentCategories as category", function () {
-          this.on("category.id", "=", "detail.equipmentCategoryId").andOnNull(
-            "category.deletedAt",
-          );
-        })
-        .leftJoin("companies as company", "company.id", "request.companyId")
-        .leftJoin("divisions as division", "division.id", "request.divisionId")
-        .select([
-          "assignment.id",
-          "assignment.uuid",
-          "assignment.statusCode",
-          "assignment.plannedStartDate",
-          "assignment.plannedEndDate",
-          "assignment.actualStartDate",
-          "assignment.actualEndDate",
-          "assignment.notes",
-          "request.uuid as requestUuid",
-          "request.requestNo",
-          "request.status as requestStatus",
-          "company.uuid as companyUuid",
-          "company.code as companyCode",
-          "company.name as companyName",
-          "division.uuid as divisionUuid",
-          "division.code as divisionCode",
-          "division.name as divisionName",
-          "detail.uuid as requestDetailUuid",
-          "category.uuid as equipmentCategoryUuid",
-          "category.code as equipmentCategoryCode",
-          "category.name as equipmentCategoryName",
-          "equipmentUnit.uuid as equipmentUnitUuid",
-          "equipmentUnit.code as equipmentUnitCode",
-          "equipmentUnit.name as equipmentUnitName",
-        ])
-        .whereNull("assignment.deletedAt")
-        .whereNull("request.deletedAt");
+      const query = buildMonitoringAssignmentQuery().select([
+        "assignment.id",
+        "assignment.uuid",
+        "assignment.statusCode",
+        "assignment.plannedStartDate",
+        "assignment.plannedEndDate",
+        "assignment.actualStartDate",
+        "assignment.actualEndDate",
+        "assignment.assignedAt",
+        "assignment.notes",
+        "assignment.isActive",
+        "assignment.createdAt",
+        "assignment.updatedAt",
+
+        "request.uuid as requestUuid",
+        "request.requestNo",
+        "request.status as requestStatus",
+        "request.requestDate",
+        "request.startDate as requestStartDate",
+        "request.endDate as requestEndDate",
+
+        "company.uuid as companyUuid",
+        "company.code as companyCode",
+        "company.name as companyName",
+
+        "division.uuid as divisionUuid",
+        "division.code as divisionCode",
+        "division.name as divisionName",
+
+        "detail.uuid as requestDetailUuid",
+
+        "category.uuid as equipmentCategoryUuid",
+        "category.code as equipmentCategoryCode",
+        "category.name as equipmentCategoryName",
+
+        "equipmentUnit.uuid as equipmentUnitUuid",
+        "equipmentUnit.unitCode as equipmentUnitCode",
+        "equipmentUnit.unitName as equipmentUnitName",
+        "equipmentUnit.assetNumber as assetNumber",
+      ]);
 
       applyRequestScope(query, access, "request");
-      applyMonitoringFilters(query, filters, "request", "company", "division");
 
-      if (req.query.statusCode) {
-        query.andWhere(
-          "assignment.statusCode",
-          normalizeRequiredString(req.query.statusCode).toUpperCase(),
-        );
-      }
+      applyMonitoringFilters(query, filters, {
+        assignment: "assignment",
+        company: "company",
+        division: "division",
+        equipment: "equipmentUnit",
+      });
 
-      if (req.query.search) {
-        const search = `%${normalizeRequiredString(req.query.search)}%`;
+      if (filters.search) {
+        const search = `%${filters.search}%`;
 
         query.andWhere((builder) => {
           builder
-            .where("request.requestNo", "like", search)
+            .where("equipmentUnit.unitCode", "like", search)
+            .orWhere("equipmentUnit.unitName", "like", search)
+            .orWhere("equipmentUnit.assetNumber", "like", search)
+            .orWhere("request.requestNo", "like", search)
             .orWhere("company.code", "like", search)
             .orWhere("company.name", "like", search)
             .orWhere("division.code", "like", search)
             .orWhere("division.name", "like", search)
             .orWhere("category.code", "like", search)
-            .orWhere("category.name", "like", search)
-            .orWhere("equipmentUnit.code", "like", search)
-            .orWhere("equipmentUnit.name", "like", search);
+            .orWhere("category.name", "like", search);
         });
       }
 
-      const assignments = await query.orderBy([
-        { column: "assignment.plannedStartDate", order: "asc" },
-        { column: "request.requestNo", order: "asc" },
-        { column: "assignment.id", order: "asc" },
+      const assignmentRows = await query.orderBy([
+        {
+          column: "assignment.plannedStartDate",
+          order: "asc",
+        },
+        {
+          column: "request.requestNo",
+          order: "asc",
+        },
+        {
+          column: "assignment.id",
+          order: "asc",
+        },
       ]);
+
+      let assignments = assignmentRows.map((assignment) => {
+        const monitoring = calculateAssignmentMonitoring(assignment);
+
+        return {
+          ...assignment,
+          isActive: Boolean(assignment.isActive),
+          operationStatus: monitoring.operationStatus,
+          slaStatus: monitoring.slaStatus,
+          remainingDays: monitoring.remainingDays,
+          isOverdue: monitoring.isOverdue,
+          isLateStart: monitoring.isLateStart,
+          isCompletedToday: monitoring.isCompletedToday,
+        };
+      });
+
+      if (filters.status) {
+        assignments = assignments.filter((assignment) => {
+          return (
+            assignment.statusCode === filters.status ||
+            assignment.requestStatus === filters.status ||
+            assignment.operationStatus === filters.status ||
+            assignment.slaStatus === filters.status
+          );
+        });
+      }
+
+      if (filters.overdueOnly) {
+        assignments = assignments.filter((assignment) => assignment.isOverdue);
+      }
 
       return res.success(assignments);
     } catch (error) {
@@ -1542,42 +1736,130 @@ router.get(
   async (req, res) => {
     try {
       const access = await getRequestAccess(req);
-      const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
 
-      if (!equipmentRequest) {
-        return res.incomplete("Equipment request tidak ditemukan.");
-      }
-
-      const [details, assignments, histories] = await Promise.all([
-        findRequestDetails(equipmentRequest.id),
-        findAssignments(equipmentRequest.id),
-        findRequestHistories(equipmentRequest.id),
-      ]);
-
-      const assignmentSummary = assignments.reduce(
-        (summary, assignment) => {
-          const statusCode = assignment.statusCode;
-          summary.total += 1;
-          summary.byStatus[statusCode] =
-            (summary.byStatus[statusCode] || 0) + 1;
-          return summary;
-        },
-        { total: 0, byStatus: {} },
+      const assignment = await findMonitoringAssignmentByUuid(
+        req.params.uuid,
+        access,
       );
 
+      if (!assignment) {
+        return res.incomplete(
+          "Equipment assignment monitoring tidak ditemukan.",
+        );
+      }
+
+      const histories = await findRequestHistories(assignment.requestId);
+
+      const approvedHistory = histories.find(
+        (history) =>
+          history.activity === "APPROVE_GTSI" ||
+          history.activity === "APPROVED",
+      );
+
+      const monitoring = calculateAssignmentMonitoring(assignment);
+
       return res.success({
-        request: normalizeRequestResult(equipmentRequest),
-        details,
-        assignments,
-        histories,
-        assignmentSummary,
+        ...assignment,
+        ...monitoring,
+        schedule: {
+          plannedStartDate: assignment.plannedStartDate,
+          plannedEndDate: assignment.plannedEndDate,
+          actualStartDate: assignment.actualStartDate,
+          actualEndDate: assignment.actualEndDate,
+          remainingDays: monitoring.remainingDays,
+          slaStatus: monitoring.slaStatus,
+        },
+        timeline: [
+          {
+            code: "APPROVED",
+            label: "Approved",
+            completed: Boolean(approvedHistory),
+            date: approvedHistory?.createdAt || null,
+          },
+          {
+            code: "ASSIGNED",
+            label: "Assigned",
+            completed: Boolean(assignment.assignedAt),
+            date: assignment.assignedAt || null,
+          },
+          {
+            code: "STARTED",
+            label: "Started",
+            completed: Boolean(assignment.actualStartDate),
+            date: assignment.actualStartDate || null,
+          },
+          {
+            code: "COMPLETED",
+            label: "Completed",
+            completed: Boolean(assignment.actualEndDate),
+            date: assignment.actualEndDate || null,
+          },
+        ],
       });
     } catch (error) {
       console.error("GET /equipment-request/monitoring/:uuid error:", error);
 
-      return res.fail(error.message || "Failed to load request monitoring.");
+      return res.fail(
+        error.message || "Failed to load equipment assignment monitoring.",
+      );
     }
   },
 );
+
+async function findMonitoringAssignmentByUuid(uuid, access, trx = db) {
+  const query = buildMonitoringAssignmentQuery(trx)
+    .leftJoin("users as assignedUser", function () {
+      this.on("assignedUser.id", "=", "assignment.assignedBy").andOnNull(
+        "assignedUser.deletedAt",
+      );
+    })
+    .select([
+      "assignment.id",
+      "assignment.uuid",
+      "assignment.requestId",
+      "assignment.requestDetailId",
+      "assignment.statusCode",
+      "assignment.plannedStartDate",
+      "assignment.plannedEndDate",
+      "assignment.actualStartDate",
+      "assignment.actualEndDate",
+      "assignment.assignedAt",
+      "assignment.notes",
+
+      "assignedUser.uuid as assignedByUuid",
+      "assignedUser.fullName as assignedByName",
+
+      "request.uuid as requestUuid",
+      "request.requestNo",
+      "request.status as requestStatus",
+      "request.requestDate",
+      "request.startDate as requestStartDate",
+      "request.endDate as requestEndDate",
+
+      "company.uuid as companyUuid",
+      "company.code as companyCode",
+      "company.name as companyName",
+
+      "division.uuid as divisionUuid",
+      "division.code as divisionCode",
+      "division.name as divisionName",
+
+      "detail.uuid as requestDetailUuid",
+
+      "category.uuid as equipmentCategoryUuid",
+      "category.code as equipmentCategoryCode",
+      "category.name as equipmentCategoryName",
+
+      "equipmentUnit.uuid as equipmentUnitUuid",
+      "equipmentUnit.unitCode as equipmentUnitCode",
+      "equipmentUnit.unitName as equipmentUnitName",
+      "equipmentUnit.assetNumber as assetNumber",
+    ])
+    .where("assignment.uuid", uuid);
+
+  applyRequestScope(query, access, "request");
+
+  return query.first();
+}
 
 module.exports = router;

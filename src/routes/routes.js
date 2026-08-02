@@ -23,6 +23,6 @@ route.use("/equipment-unit", require("./equipment/unit"));
 route.use("/equipment-request", require("./equipment-request"));
 
 route.use("/file-attachment", require("./file-attachment/file-attachment"));
-route.use("/audit-log", require("./audit-log/audit-log"));
+route.use("/home", require("./home/dashboard"));
 
 module.exports = route;
