@@ -3,6 +3,7 @@
 require("dotenv").config();
 
 const express = require("express");
+const path = require("path");
 
 const request = require("./src/lib/request");
 const response = require("./src/lib/response");
@@ -24,6 +25,8 @@ app.use(
     extended: true,
   }),
 );
+
+app.use("/public", express.static(path.join(process.cwd(), "public")));
 
 app.use("/user-session", userSessionRoutes);
 app.use("/api/v1", routes);

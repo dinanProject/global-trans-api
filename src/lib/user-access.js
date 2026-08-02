@@ -127,6 +127,18 @@ async function getUserAccess(userId, trx = db) {
 
     permissionCodes: permissions.map((permission) => permission.code),
   };
+
+  const databaseResult = await trx.raw("SELECT DATABASE() AS databaseName");
+
+  const databaseRows = Array.isArray(databaseResult)
+    ? databaseResult[0]
+    : databaseResult;
+
+  console.log("GET USER ACCESS RESULT:", {
+    userId: user.id,
+    roles,
+    permissionCount: permissions.length,
+  });
 }
 
 module.exports = {

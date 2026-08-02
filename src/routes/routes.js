@@ -20,17 +20,8 @@ route.use("/company", require("./company/company"));
 route.use("/division", require("./division/division"));
 route.use("/equipment-category", require("./equipment/category"));
 route.use("/equipment-unit", require("./equipment/unit"));
-route.use(
-  "/equipment-request",
-  require("./equipment-request/equipment-request"),
-);
+route.use("/equipment-request", require("./equipment-request"));
 
-route.use("/email-template", require("./email-template/email-template"));
-route.use("/email-outbox", require("./email-outbox/email-outbox"));
-route.use(
-  "/equipment-monitoring",
-  require("./equipment-monitoring/equipment-monitoring"),
-);
 route.use("/file-attachment", require("./file-attachment/file-attachment"));
 route.use("/audit-log", require("./audit-log/audit-log"));
 

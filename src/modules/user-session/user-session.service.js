@@ -47,7 +47,7 @@ async function getUserSession(authUser) {
   const permissionRows = await db("rolePermissions as rp")
     .distinct("rp.permissionId")
     .join("userRoles as ur", "ur.roleId", "rp.roleId")
-    .where("ur.userId", authUser.userId);
+    .where("ur.userId", userId);
 
   const permissionIds = new Set(
     permissionRows.map((item) => String(item.permissionId)),
