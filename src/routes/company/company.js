@@ -8,6 +8,27 @@ const router = express.Router();
 const authentication = require("../../lib/authentication");
 const db = require("../../lib/db")();
 
+const HOLDER_COMPANY_TYPE = 1;
+const GLOBAL_APPROVER_ROLE_CODE = "ADM_GLBL";
+
+const REQUESTER_PERMISSION_CODES = [
+  "AUTH.LOGIN",
+  "AUTH.VIEW_PROFILE",
+  "EQUIPMENT_REQUEST.VIEW",
+  "EQUIPMENT_REQUEST.CREATE",
+  "EQUIPMENT_REQUEST.UPDATE",
+  "EQUIPMENT_REQUEST.DELETE",
+  "EQUIPMENT_REQUEST.SUBMIT",
+];
+
+const CLIENT_APPROVER_PERMISSION_CODES = [
+  "AUTH.LOGIN",
+  "AUTH.VIEW_PROFILE",
+  "EQUIPMENT_APPROVAL.VIEW",
+  "EQUIPMENT_APPROVAL.CLIENT_APPROVE",
+  "EQUIPMENT_APPROVAL.CLIENT_REJECT",
+];
+
 router.use(authentication);
 
 /**
@@ -163,7 +184,7 @@ router
       const now = db.fn.now();
       const uuid = randomUUID();
 
-      await trx("companies").insert({
+      const insertResult = await trx("companies").insert({
         uuid,
         code: payload.code,
         name: payload.name,
@@ -180,6 +201,28 @@ router
         updatedAt: now,
         deletedAt: null,
       });
+
+      const companyId = getInsertedId(insertResult);
+
+      /*
+       * Company holder Global Trans tidak dibuatkan role client
+       * dan approval flow client.
+       *
+       * Company selain holder otomatis dibuatkan:
+       * - role requester
+       * - role approver
+       * - permission default role
+       * - approval flow CLIENT level 1
+       * - approval flow GTSI level 2
+       */
+      if (payload.typeId !== HOLDER_COMPANY_TYPE) {
+        await provisionCompanyEquipmentAccess(trx, {
+          companyId,
+          companyCode: payload.code,
+          companyName: payload.name,
+          now,
+        });
+      }
 
       await trx.commit();
 
@@ -417,6 +460,245 @@ async function findCompanyByUuid(uuid) {
     .where("company.uuid", uuid)
     .whereNull("company.deletedAt")
     .first();
+}
+
+/**
+ * Provision default equipment-request access for a new client company.
+ *
+ * Function ini hanya dipanggil pada POST /company.
+ * Tidak dipanggil pada PUT /company.
+ */
+async function provisionCompanyEquipmentAccess(
+  trx,
+  { companyId, companyCode, companyName, now },
+) {
+  const requesterRoleCode = `${companyCode}_REQ`;
+  const approverRoleCode = `${companyCode}_APPR`;
+
+  const requesterRoleId = await ensureRole(trx, {
+    code: requesterRoleCode,
+    name: `${companyName} Requester`,
+    description: `Requester equipment untuk ${companyName}.`,
+    companyId,
+    now,
+  });
+
+  const approverRoleId = await ensureRole(trx, {
+    code: approverRoleCode,
+    name: `${companyName} Approver`,
+    description: `Approver equipment untuk ${companyName}.`,
+    companyId,
+    now,
+  });
+
+  await ensureRolePermissions(
+    trx,
+    requesterRoleId,
+    REQUESTER_PERMISSION_CODES,
+    "COMPANY",
+  );
+
+  await ensureRolePermissions(
+    trx,
+    approverRoleId,
+    CLIENT_APPROVER_PERMISSION_CODES,
+    "COMPANY",
+  );
+
+  const holderCompany = await trx("companies")
+    .where("type", HOLDER_COMPANY_TYPE)
+    .where("isActive", true)
+    .whereNull("deletedAt")
+    .orderBy("id", "asc")
+    .first("id");
+
+  if (!holderCompany) {
+    throw new Error("Company holder Global Trans aktif tidak ditemukan.");
+  }
+
+  const globalApproverRole = await trx("roles")
+    .whereRaw("UPPER(code) = ?", [GLOBAL_APPROVER_ROLE_CODE])
+    .first("id");
+
+  if (!globalApproverRole) {
+    throw new Error(`Role ${GLOBAL_APPROVER_ROLE_CODE} tidak ditemukan.`);
+  }
+
+  await ensureEquipmentApprovalFlow(trx, {
+    requestCompanyId: companyId,
+    approvalLevel: 1,
+    companyId,
+    roleId: approverRoleId,
+    actorStage: "CLIENT",
+    now,
+  });
+
+  await ensureEquipmentApprovalFlow(trx, {
+    requestCompanyId: companyId,
+    approvalLevel: 2,
+    companyId: holderCompany.id,
+    roleId: globalApproverRole.id,
+    actorStage: "GTSI",
+    now,
+  });
+}
+
+/**
+ * Mencari role berdasarkan code.
+ * Jika belum ada, role dibuat.
+ */
+async function ensureRole(trx, { code, name, description, companyId, now }) {
+  const normalizedCode = normalizeRequiredString(code).toUpperCase();
+
+  const existingRole = await trx("roles")
+    .whereRaw("UPPER(code) = ?", [normalizedCode])
+    .first(["id", "companyId"]);
+
+  if (existingRole) {
+    if (Number(existingRole.companyId) !== Number(companyId)) {
+      throw new Error(
+        `Role code "${normalizedCode}" sudah digunakan oleh company lain.`,
+      );
+    }
+
+    return Number(existingRole.id);
+  }
+
+  const insertResult = await trx("roles").insert({
+    uuid: randomUUID(),
+    code: normalizedCode,
+    name,
+    description,
+    companyId,
+    isSystem: false,
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  return getInsertedId(insertResult);
+}
+
+/**
+ * Permission master tidak dibuat di sini.
+ *
+ * Function ini hanya mengambil permission yang sudah dibuat
+ * oleh System Developer, kemudian memasangnya ke role.
+ */
+async function ensureRolePermissions(trx, roleId, permissionCodes, dataScope) {
+  const permissions = await trx("permissions")
+    .whereIn("code", permissionCodes)
+    .select(["permissionId", "code"]);
+
+  const foundCodes = new Set(permissions.map((permission) => permission.code));
+
+  const missingCodes = permissionCodes.filter(
+    (permissionCode) => !foundCodes.has(permissionCode),
+  );
+
+  if (missingCodes.length > 0) {
+    throw new Error(
+      `Permission default belum tersedia: ${missingCodes.join(
+        ", ",
+      )}. Hubungi System Developer.`,
+    );
+  }
+
+  const permissionIds = permissions.map(
+    (permission) => permission.permissionId,
+  );
+
+  const existingPermissionIds = await trx("rolePermissions")
+    .where("roleId", roleId)
+    .whereIn("permissionId", permissionIds)
+    .pluck("permissionId");
+
+  const existingPermissionSet = new Set(existingPermissionIds.map(Number));
+
+  const rows = permissions
+
+    .filter(
+      (permission) =>
+        !existingPermissionSet.has(Number(permission.permissionId)),
+    )
+
+    .map((permission) => ({
+      roleId,
+      permissionId: permission.permissionId,
+      dataScopeId: null,
+      dataScope,
+      createdAt: db.fn.now(),
+    }));
+
+  if (rows.length > 0) {
+    await trx("rolePermissions").insert(rows);
+  }
+}
+
+/**
+ * Membuat flow jika belum ada.
+ *
+ * Jika flow pada level yang sama sudah ada, konfigurasi flow
+ * tersebut disinkronkan, bukan membuat duplikat.
+ */
+async function ensureEquipmentApprovalFlow(
+  trx,
+  { requestCompanyId, approvalLevel, companyId, roleId, actorStage, now },
+) {
+  const existingFlow = await trx("equipmentApprovalFlows")
+    .where("requestCompanyId", requestCompanyId)
+    .where("approvalLevel", approvalLevel)
+    .whereNull("deletedAt")
+    .first("id");
+
+  if (existingFlow) {
+    await trx("equipmentApprovalFlows").where("id", existingFlow.id).update({
+      companyId,
+      roleId,
+      actorStage,
+      isActive: true,
+      updatedAt: now,
+      deletedAt: null,
+    });
+
+    return;
+  }
+
+  await trx("equipmentApprovalFlows").insert({
+    uuid: randomUUID(),
+    requestCompanyId,
+    approvalLevel,
+    companyId,
+    roleId,
+    actorStage,
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+    deletedAt: null,
+  });
+}
+
+function getInsertedId(insertResult) {
+  const firstResult = Array.isArray(insertResult)
+    ? insertResult[0]
+    : insertResult;
+
+  if (firstResult && typeof firstResult === "object") {
+    const id =
+      firstResult.id ?? firstResult.insertId ?? firstResult.permissionId;
+
+    if (id !== undefined && id !== null) {
+      return Number(id);
+    }
+  }
+
+  const insertedId = Number(firstResult);
+
+  if (!Number.isInteger(insertedId) || insertedId <= 0) {
+    throw new Error("Gagal mendapatkan ID data yang baru dibuat.");
+  }
+
+  return insertedId;
 }
 
 function normalizePayload(payload = {}) {

@@ -14,7 +14,6 @@ router
     try {
       const roles = await db("roles as r")
         .leftJoin("rolePermissions as rp", "rp.roleId", "r.id")
-
         .leftJoin("userRoles as ur", "ur.roleId", "r.id")
 
         .select([
