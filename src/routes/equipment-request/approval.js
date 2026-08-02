@@ -13,9 +13,16 @@ const {
 } = require("../../services/equipment-request/email");
 
 const HOLDER_COMPANY_TYPE = 1;
-const STATUS_DRAFT = "DRAFT";
+
 const ACTION_SUBMIT = "SUBMIT";
-const ACTION_GTSI_REVIEW = "START_GTSI_REVIEW";
+const ACTION_APPROVE_CLIENT = "APPROVE_CLIENT";
+const ACTION_APPROVE_GTSI = "APPROVE_GTSI";
+const ACTION_REJECT_CLIENT = "REJECT_CLIENT";
+const ACTION_REJECT_GTSI = "REJECT_GTSI";
+
+const APPROVAL_STATUS_PENDING = "PENDING";
+const APPROVAL_STATUS_APPROVED = "APPROVED";
+const APPROVAL_STATUS_REJECTED = "REJECTED";
 
 router.use(authentication);
 
@@ -350,14 +357,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       return res.incomplete(approvalResult.message);
     }
 
-    const reviewSchedule = normalizeReviewSchedulePayload(req.body);
-
-    if (actionCode === ACTION_GTSI_REVIEW && !reviewSchedule.valid) {
-      await trx.rollback();
-
-      return res.incomplete(reviewSchedule.message);
-    }
-
     const now = db.fn.now();
     const nextApprovalLevel = await findNextPendingApprovalLevel(
       trx,
@@ -372,11 +371,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       updatedAt: now,
     };
 
-    if (actionCode === ACTION_GTSI_REVIEW) {
-      requestUpdatePayload.startDate = reviewSchedule.startDate;
-      requestUpdatePayload.endDate = reviewSchedule.endDate;
-    }
-
     await trx("equipmentRequests")
       .where("id", equipmentRequest.id)
       .update(requestUpdatePayload);
@@ -387,7 +381,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       description: buildActionHistoryDescription({
         transition,
         remarks,
-        reviewSchedule,
       }),
       userId: access.user.id,
       createdAt: now,
@@ -686,17 +679,7 @@ function normalizeReviewSchedulePayload(payload = {}) {
   };
 }
 
-function buildActionHistoryDescription({
-  transition,
-  remarks,
-  reviewSchedule,
-}) {
-  if (transition.actionCode === ACTION_GTSI_REVIEW && reviewSchedule?.valid) {
-    const scheduleText = `Jadwal direview menjadi ${reviewSchedule.startDate} sampai ${reviewSchedule.endDate}.`;
-
-    return remarks ? `${scheduleText} Catatan: ${remarks}` : scheduleText;
-  }
-
+function buildActionHistoryDescription({ transition, remarks }) {
   return (
     remarks ||
     `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`
@@ -1034,7 +1017,7 @@ async function generateRequestApprovals(trx, equipmentRequest) {
       companyId: flow.companyId,
       roleId: flow.roleId,
       userId: null,
-      status: "PENDING",
+      status: APPROVAL_STATUS_PENDING,
       remarks: null,
       actionDate: null,
       isActive: true,
@@ -1052,8 +1035,12 @@ async function processPendingApproval(
   { equipmentRequest, transition, access, remarks },
 ) {
   const actionCode = transition.actionCode;
-  const isApprovalAction =
-    actionCode.includes("APPROVE") || actionCode.includes("REJECT");
+  const isApprovalAction = [
+    ACTION_APPROVE_CLIENT,
+    ACTION_APPROVE_GTSI,
+    ACTION_REJECT_CLIENT,
+    ACTION_REJECT_GTSI,
+  ].includes(actionCode);
 
   if (!isApprovalAction) {
     return { valid: true };
@@ -1082,7 +1069,7 @@ async function processPendingApproval(
     .where("approvalLevel", equipmentRequest.currentApprovalLevel)
     .where("companyId", access.company.id)
     .whereIn("roleId", userRoleIds)
-    .where("status", "PENDING")
+    .where("status", APPROVAL_STATUS_PENDING)
     .where("isActive", true)
     .whereNull("deletedAt")
     .orderBy("id", "asc")
@@ -1102,7 +1089,9 @@ async function processPendingApproval(
     .where("id", pendingApproval.id)
     .update({
       userId: access.user.id,
-      status: actionCode.includes("REJECT") ? "REJECTED" : "APPROVED",
+      status: [ACTION_REJECT_CLIENT, ACTION_REJECT_GTSI].includes(actionCode)
+        ? APPROVAL_STATUS_REJECTED
+        : APPROVAL_STATUS_APPROVED,
       remarks,
       actionDate: now,
       updatedAt: now,
@@ -1114,7 +1103,7 @@ async function processPendingApproval(
 async function findNextPendingApprovalLevel(trx, requestId) {
   const pendingApproval = await trx("equipmentRequestApprovals")
     .where("requestId", requestId)
-    .where("status", "PENDING")
+    .where("status", APPROVAL_STATUS_PENDING)
     .where("isActive", true)
     .whereNull("deletedAt")
     .orderBy("approvalLevel", "asc")

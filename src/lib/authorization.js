@@ -102,11 +102,6 @@ function authorization(
               ownedPermissions.has(permission),
             );
 
-        console.log("AUTHORIZATION CHECK:", {
-          userId: authenticatedUserId,
-          requiredPermissions,
-          ownedPermissions: access.permissionCodes,
-        });
         if (!isAllowed) {
           return res.unauthorized(
             "You do not have permission to perform this action.",

@@ -10,9 +10,17 @@ const authorization = require("../../lib/authorization");
 const db = require("../../lib/db")();
 
 const HOLDER_COMPANY_TYPE = 1;
-const STATUS_DRAFT = "DRAFT";
-const ACTION_SUBMIT = "SUBMIT";
-const ACTION_GTSI_REVIEW = "START_GTSI_REVIEW";
+
+const STATUS_APPROVED = "APPROVED";
+const STATUS_ASSIGNED = "ASSIGNED";
+const STATUS_IN_PROGRESS = "IN_PROGRESS";
+const STATUS_COMPLETED = "COMPLETED";
+
+const ASSIGNMENT_STATUS_ASSIGNED = "ASSIGNED";
+const ASSIGNMENT_STATUS_IN_OPERATION = "IN_OPERATION";
+const ASSIGNMENT_STATUS_COMPLETED = "COMPLETED";
+const ASSIGNMENT_STATUS_REPLACED = "REPLACED";
+const ASSIGNMENT_STATUS_CANCELLED = "CANCELLED";
 
 router.use(authentication);
 
@@ -276,17 +284,7 @@ function normalizeReviewSchedulePayload(payload = {}) {
   };
 }
 
-function buildActionHistoryDescription({
-  transition,
-  remarks,
-  reviewSchedule,
-}) {
-  if (transition.actionCode === ACTION_GTSI_REVIEW && reviewSchedule?.valid) {
-    const scheduleText = `Jadwal direview menjadi ${reviewSchedule.startDate} sampai ${reviewSchedule.endDate}.`;
-
-    return remarks ? `${scheduleText} Catatan: ${remarks}` : scheduleText;
-  }
-
+function buildActionHistoryDescription({ transition, remarks }) {
   return (
     remarks ||
     `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`
@@ -1139,7 +1137,7 @@ router.post(
         requestId: equipmentRequest.id,
         requestDetailId: requestDetail.id,
         equipmentUnitId: equipmentUnit.id,
-        statusCode: "ASSIGNED",
+        statusCode: ASSIGNMENT_STATUS_ASSIGNED,
         plannedStartDate: payload.plannedStartDate,
         plannedEndDate: payload.plannedEndDate,
         actualStartDate: null,
@@ -1298,7 +1296,7 @@ router.post(
         requestId: equipmentRequest.id,
         requestDetailId: existingAssignment.requestDetailId,
         equipmentUnitId: equipmentUnit.id,
-        statusCode: "ASSIGNED",
+        statusCode: ASSIGNMENT_STATUS_ASSIGNED,
         plannedStartDate: existingAssignment.plannedStartDate,
         plannedEndDate: existingAssignment.plannedEndDate,
         actualStartDate: null,
@@ -1324,7 +1322,7 @@ router.post(
       await trx("equipmentAssignments")
         .where("id", existingAssignment.id)
         .update({
-          statusCode: "REPLACED",
+          statusCode: ASSIGNMENT_STATUS_REPLACED,
           replacedByAssignmentId: replacementId,
           replacementReason,
           releasedBy: access.user.id,
