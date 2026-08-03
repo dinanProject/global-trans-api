@@ -4,10 +4,15 @@ const express = require("express");
 const { randomUUID } = require("crypto");
 
 const router = express.Router();
-
+const db = require("../../lib/db")();
 const authentication = require("../../lib/authentication");
 const authorization = require("../../lib/authorization");
-const db = require("../../lib/db")();
+
+const {
+  enqueueAssignmentNotifications,
+  enqueueOperationStartedNotifications,
+  enqueueOperationCompletedNotifications,
+} = require("../../services/equipment-request/email");
 
 const HOLDER_COMPANY_TYPE = 1;
 
@@ -1156,7 +1161,11 @@ router.post(
         deletedAt: null,
       });
 
-      await synchronizeRequestAssignmentStatus(trx, equipmentRequest.id);
+      // await synchronizeRequestAssignmentStatus(trx, equipmentRequest.id);
+      const assignmentStatusResult = await synchronizeRequestAssignmentStatus(
+        trx,
+        equipmentRequest.id,
+      );
 
       await insertRequestHistory(trx, {
         requestId: equipmentRequest.id,
@@ -1165,6 +1174,14 @@ router.post(
         userId: access.user.id,
         createdAt: now,
       });
+
+      if (assignmentStatusResult.statusChanged) {
+        await enqueueAssignmentNotifications(trx, {
+          requestId: equipmentRequest.id,
+          actionUserId: access.user.id,
+          previousStatusCode: assignmentStatusResult.previousStatusCode,
+        });
+      }
 
       await trx.commit();
 
@@ -1448,7 +1465,11 @@ async function updateAssignmentOperation(req, res, destinationStatus) {
       .where("id", assignment.id)
       .update(updatePayload);
 
-    await synchronizeRequestOperationalStatus(trx, equipmentRequest.id);
+    // await synchronizeRequestOperationalStatus(trx, equipmentRequest.id);
+    const operationalStatusResult = await synchronizeRequestOperationalStatus(
+      trx,
+      equipmentRequest.id,
+    );
 
     await insertRequestHistory(trx, {
       requestId: equipmentRequest.id,
@@ -1464,6 +1485,30 @@ async function updateAssignmentOperation(req, res, destinationStatus) {
       userId: access.user.id,
       createdAt: now,
     });
+
+    if (
+      destinationStatus === ASSIGNMENT_STATUS_IN_OPERATION &&
+      operationalStatusResult.statusChanged &&
+      operationalStatusResult.statusCode === STATUS_IN_PROGRESS
+    ) {
+      await enqueueOperationStartedNotifications(trx, {
+        requestId: equipmentRequest.id,
+        actionUserId: access.user.id,
+        previousStatusCode: operationalStatusResult.previousStatusCode,
+      });
+    }
+
+    if (
+      destinationStatus === ASSIGNMENT_STATUS_COMPLETED &&
+      operationalStatusResult.statusChanged &&
+      operationalStatusResult.statusCode === STATUS_COMPLETED
+    ) {
+      await enqueueOperationCompletedNotifications(trx, {
+        requestId: equipmentRequest.id,
+        actionUserId: access.user.id,
+        previousStatusCode: operationalStatusResult.previousStatusCode,
+      });
+    }
 
     await trx.commit();
 
@@ -1712,6 +1757,19 @@ async function validateEquipmentSchedule(trx, payload) {
 }
 
 async function synchronizeRequestAssignmentStatus(trx, requestId) {
+  const request = await trx("equipmentRequests")
+    .where("id", requestId)
+    .whereNull("deletedAt")
+    .first(["status"]);
+
+  if (!request) {
+    return {
+      statusChanged: false,
+      previousStatusCode: null,
+      statusCode: null,
+    };
+  }
+
   const details = await trx("equipmentRequestDetails")
     .where("requestId", requestId)
     .where("isActive", true)
@@ -1719,7 +1777,11 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
     .select(["id", "quantity"]);
 
   if (details.length === 0) {
-    return;
+    return {
+      statusChanged: false,
+      previousStatusCode: request.status,
+      statusCode: request.status,
+    };
   }
 
   for (const detail of details) {
@@ -1731,20 +1793,49 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
         ASSIGNMENT_STATUS_REPLACED,
         ASSIGNMENT_STATUS_CANCELLED,
       ])
-      .count({
-        total: "id",
-      })
+      .count({ total: "id" })
       .first();
 
     if (Number(result?.total || 0) < Number(detail.quantity)) {
-      return;
+      return {
+        statusChanged: false,
+        previousStatusCode: request.status,
+        statusCode: request.status,
+      };
     }
   }
 
+  if (request.status === STATUS_ASSIGNED) {
+    return {
+      statusChanged: false,
+      previousStatusCode: STATUS_ASSIGNED,
+      statusCode: STATUS_ASSIGNED,
+    };
+  }
+
   await updateRequestStatusIfAvailable(trx, requestId, STATUS_ASSIGNED);
+
+  return {
+    statusChanged: true,
+    previousStatusCode: request.status,
+    statusCode: STATUS_ASSIGNED,
+  };
 }
 
 async function synchronizeRequestOperationalStatus(trx, requestId) {
+  const request = await trx("equipmentRequests")
+    .where("id", requestId)
+    .whereNull("deletedAt")
+    .first(["status"]);
+
+  if (!request) {
+    return {
+      statusChanged: false,
+      previousStatusCode: null,
+      statusCode: null,
+    };
+  }
+
   const assignments = await trx("equipmentAssignments")
     .where("requestId", requestId)
     .where("isActive", true)
@@ -1756,26 +1847,62 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
     .select(["statusCode"]);
 
   if (assignments.length === 0) {
-    return;
+    return {
+      statusChanged: false,
+      previousStatusCode: request.status,
+      statusCode: request.status,
+    };
   }
 
-  if (
-    assignments.every(
-      (assignment) => assignment.statusCode === ASSIGNMENT_STATUS_COMPLETED,
-    )
-  ) {
+  const allCompleted = assignments.every(
+    (assignment) => assignment.statusCode === ASSIGNMENT_STATUS_COMPLETED,
+  );
+
+  if (allCompleted) {
+    if (request.status === STATUS_COMPLETED) {
+      return {
+        statusChanged: false,
+        previousStatusCode: STATUS_COMPLETED,
+        statusCode: STATUS_COMPLETED,
+      };
+    }
+
     await updateRequestStatusIfAvailable(trx, requestId, STATUS_COMPLETED);
 
-    return;
+    return {
+      statusChanged: true,
+      previousStatusCode: request.status,
+      statusCode: STATUS_COMPLETED,
+    };
   }
 
-  if (
-    assignments.some(
-      (assignment) => assignment.statusCode === ASSIGNMENT_STATUS_IN_OPERATION,
-    )
-  ) {
+  const hasInOperation = assignments.some(
+    (assignment) => assignment.statusCode === ASSIGNMENT_STATUS_IN_OPERATION,
+  );
+
+  if (hasInOperation) {
+    if (request.status === STATUS_IN_PROGRESS) {
+      return {
+        statusChanged: false,
+        previousStatusCode: STATUS_IN_PROGRESS,
+        statusCode: STATUS_IN_PROGRESS,
+      };
+    }
+
     await updateRequestStatusIfAvailable(trx, requestId, STATUS_IN_PROGRESS);
+
+    return {
+      statusChanged: true,
+      previousStatusCode: request.status,
+      statusCode: STATUS_IN_PROGRESS,
+    };
   }
+
+  return {
+    statusChanged: false,
+    previousStatusCode: request.status,
+    statusCode: request.status,
+  };
 }
 
 async function updateRequestStatusIfAvailable(trx, requestId, statusCode) {

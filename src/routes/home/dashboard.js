@@ -597,7 +597,7 @@ async function getOperationsByCompany(access, filters, range, trx = db) {
  * - companyUuid
  * - divisionUuid
  */
-router.get("/", authorization("EQUIPMENT_REQUEST.VIEW"), async (req, res) => {
+router.get("/", async (req, res) => {
   try {
     const access = await getRequestAccess(req);
     const period = normalizePeriod(req.query.period);

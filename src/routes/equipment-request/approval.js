@@ -309,6 +309,18 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       return res.incomplete("Remarks wajib diisi untuk action ini.");
     }
 
+    let reviewedSchedule = null;
+
+    if (actionCode === "APPROVE_GTSI") {
+      reviewedSchedule = normalizeReviewSchedulePayload(req.body);
+
+      if (!reviewedSchedule.valid) {
+        await trx.rollback();
+
+        return res.incomplete(reviewedSchedule.message);
+      }
+    }
+
     if (actionCode === ACTION_SUBMIT) {
       const activeDetails = await trx("equipmentRequestDetails")
         .where("requestId", equipmentRequest.id)
@@ -370,6 +382,11 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       approvalLocked: Boolean(transition.lockRequest),
       updatedAt: now,
     };
+
+    if (reviewedSchedule) {
+      requestUpdatePayload.startDate = reviewedSchedule.startDate;
+      requestUpdatePayload.endDate = reviewedSchedule.endDate;
+    }
 
     await trx("equipmentRequests")
       .where("id", equipmentRequest.id)
