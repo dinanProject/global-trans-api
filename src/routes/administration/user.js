@@ -7,6 +7,7 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 const db = require("../../lib/db")();
 
 router.use(authentication);
@@ -71,6 +72,20 @@ router
           "division.code",
           "division.name",
         ]);
+
+      if (!isSystemDeveloper(req)) {
+        query.whereNotExists(function () {
+          this.select(db.raw("1"))
+            .from("userRoles as protectedUserRole")
+            .join(
+              "roles as protectedRole",
+              "protectedRole.id",
+              "protectedUserRole.roleId",
+            )
+            .whereRaw("protectedUserRole.userId = user.id")
+            .where("protectedRole.code", "SYSTEM_DEVELOPER");
+        });
+      }
 
       if (search) {
         const normalizedSearch = `%${String(search).trim()}%`;
@@ -478,64 +493,147 @@ router
   /**
    * PUT /user/:uuid/reset-password
    */
-  .put("/:uuid/reset-password", async (req, res) => {
-    const trx = await db.transaction();
+  .put(
+    "/:uuid/reset-password",
+    authorization("USER.RESET_PASSWORD", {
+      holderOnly: true,
+    }),
+    async (req, res) => {
+      const trx = await db.transaction();
 
-    try {
-      const password = normalizeRequiredString(req.body?.password);
+      try {
+        const password = normalizeRequiredString(req.body?.password);
 
-      if (password.length < 8 || password.length > 100) {
+        if (password.length < 8 || password.length > 100) {
+          await trx.rollback();
+
+          return res.incomplete("Password harus 8 sampai 100 karakter.");
+        }
+
+        const user = await trx("users")
+          .where("uuid", req.params.uuid)
+          .whereNull("deletedAt")
+          .first(["id", "uuid"]);
+
+        if (!user) {
+          await trx.rollback();
+
+          return res.incomplete("User tidak ditemukan.");
+        }
+
+        const systemDeveloperRole = await trx("userRoles as userRole")
+          .join("roles as role", "role.id", "userRole.roleId")
+          .where("userRole.userId", user.id)
+          .where("role.code", "SYSTEM_DEVELOPER")
+          .first("userRole.id");
+
+        if (systemDeveloperRole && !isSystemDeveloper(req)) {
+          await trx.rollback();
+
+          return res.unauthorized(
+            "Global Admin tidak dapat mereset password System Developer.",
+          );
+        }
+
+        await trx("users")
+          .where("id", user.id)
+          .update({
+            password: await bcrypt.hash(password, 12),
+            updatedAt: db.fn.now(),
+          });
+
+        await revokeRefreshTokens(trx, user.id);
+        await trx.commit();
+
+        return res.success({
+          uuid: user.uuid,
+        });
+      } catch (error) {
         await trx.rollback();
 
-        return res.incomplete("Password harus 8 sampai 100 karakter.");
+        console.error("PUT /user/:uuid/reset-password error:", error);
+
+        return res.fail(error.message || "Failed to reset password.");
       }
+    },
+  )
 
-      const user = await trx("users")
-        .where("uuid", req.params.uuid)
-        .whereNull("deletedAt")
-        .first(["id", "uuid"]);
+  /**
+   * PUT /user/:uuid/reset-default-password
+   */
+  .put(
+    "/:uuid/reset-default-password",
+    authorization("USER.RESET_PASSWORD", {
+      holderOnly: true,
+    }),
+    async (req, res) => {
+      const trx = await db.transaction();
 
-      if (!user) {
+      try {
+        const defaultPassword = normalizeRequiredString(
+          process.env.DEFAULT_USER_PASSWORD,
+        );
+
+        if (defaultPassword.length < 8 || defaultPassword.length > 100) {
+          await trx.rollback();
+
+          return res.fail("Default user password configuration is invalid.");
+        }
+
+        const user = await trx("users")
+          .where("uuid", req.params.uuid)
+          .whereNull("deletedAt")
+          .first(["id", "uuid", "fullName", "email", "isActive"]);
+
+        if (!user) {
+          await trx.rollback();
+
+          return res.incomplete("User tidak ditemukan.");
+        }
+
+        const systemDeveloperRole = await trx("userRoles as userRole")
+          .join("roles as role", "role.id", "userRole.roleId")
+          .where("userRole.userId", user.id)
+          .where("role.code", "SYSTEM_DEVELOPER")
+          .first("userRole.id");
+
+        if (systemDeveloperRole && !isSystemDeveloper(req)) {
+          await trx.rollback();
+
+          return res.unauthorized(
+            "Global Admin tidak dapat mereset password System Developer.",
+          );
+        }
+
+        await trx("users")
+          .where("id", user.id)
+          .update({
+            password: await bcrypt.hash(defaultPassword, 12),
+            updatedAt: db.fn.now(),
+          });
+
+        await revokeRefreshTokens(trx, user.id);
+        await trx.commit();
+
+        return res.success(
+          {
+            uuid: user.uuid,
+            fullName: user.fullName,
+            email: user.email,
+          },
+          "Password berhasil dikembalikan ke default.",
+        );
+      } catch (error) {
         await trx.rollback();
 
-        return res.incomplete("User tidak ditemukan.");
-      }
+        console.error("PUT /user/:uuid/reset-default-password error:", error);
 
-      const systemDeveloperRole = await trx("userRoles as userRole")
-        .join("roles as role", "role.id", "userRole.roleId")
-        .where("userRole.userId", user.id)
-        .where("role.code", "SYSTEM_DEVELOPER")
-        .first("userRole.id");
-
-      if (systemDeveloperRole && !isSystemDeveloper(req)) {
-        await trx.rollback();
-
-        return res.unauthorized(
-          "Global Admin tidak dapat mereset password System Developer.",
+        return res.fail(
+          error.message || "Failed to reset password to default.",
         );
       }
-
-      await trx("users")
-        .where("id", user.id)
-        .update({
-          password: await bcrypt.hash(password, 12),
-          updatedAt: db.fn.now(),
-        });
-
-      await revokeRefreshTokens(trx, user.id);
-      await trx.commit();
-
-      return res.success({
-        uuid: user.uuid,
-      });
-    } catch (error) {
-      await trx.rollback();
-
-      console.error("PUT /user/:uuid/reset-password error:", error);
-
-      return res.fail(error.message || "Failed to reset password.");
-    }
-  })
+    },
+  )
 
   /**
    * DELETE /user/:uuid

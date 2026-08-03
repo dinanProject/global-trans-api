@@ -155,6 +155,118 @@ route
     }
   })
 
+  .put("/change-password", authentication, async function (req, res, next) {
+    const trx = await db.transaction();
+
+    try {
+      const authenticatedUser = req.getUser();
+
+      const userId = authenticatedUser?.userId ?? authenticatedUser?.id;
+
+      if (!userId) {
+        await trx.rollback();
+
+        return res.unauthenticated();
+      }
+
+      const currentPassword =
+        typeof req.body?.currentPassword === "string"
+          ? req.body.currentPassword
+          : "";
+
+      const newPassword =
+        typeof req.body?.newPassword === "string" ? req.body.newPassword : "";
+
+      const confirmPassword =
+        typeof req.body?.confirmPassword === "string"
+          ? req.body.confirmPassword
+          : "";
+
+      if (!currentPassword || !newPassword || !confirmPassword) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Current password, new password, and confirmation are required.",
+        );
+      }
+
+      if (newPassword.length < 8 || newPassword.length > 100) {
+        await trx.rollback();
+
+        return res.incomplete("New password must contain 8 to 100 characters.");
+      }
+
+      if (newPassword !== confirmPassword) {
+        await trx.rollback();
+
+        return res.incomplete("New password confirmation does not match.");
+      }
+
+      const user = await trx("users")
+        .where({
+          id: userId,
+          isActive: true,
+        })
+        .whereNull("deletedAt")
+        .forUpdate()
+        .first(["id", "uuid", "email", "password"]);
+
+      if (!user) {
+        await trx.rollback();
+
+        return res.unauthenticated("User is inactive or no longer available.");
+      }
+
+      const currentPasswordValid = await bcrypt.compare(
+        currentPassword,
+        user.password,
+      );
+
+      if (!currentPasswordValid) {
+        await trx.rollback();
+
+        return res.incomplete("Current password is incorrect.");
+      }
+
+      const sameAsCurrentPassword = await bcrypt.compare(
+        newPassword,
+        user.password,
+      );
+
+      if (sameAsCurrentPassword) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "New password must be different from the current password.",
+        );
+      }
+
+      await trx("users")
+        .where("id", user.id)
+        .update({
+          password: await bcrypt.hash(newPassword, 12),
+          updatedAt: new Date(),
+        });
+
+      await trx("refreshTokens")
+        .where("userId", user.id)
+        .whereNull("revokedAt")
+        .update({
+          revokedAt: new Date(),
+        });
+
+      await trx.commit();
+
+      return res.success(
+        null,
+        "Password changed successfully. Please login again.",
+      );
+    } catch (err) {
+      await trx.rollback();
+      next(err);
+    }
+  })
+
   .post("/refresh-token", async function (req, res, next) {
     const trx = await db.transaction();
 

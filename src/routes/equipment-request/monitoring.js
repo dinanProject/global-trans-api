@@ -1483,7 +1483,7 @@ function buildMonitoringAssignmentQuery(trx = db) {
  */
 router.get(
   "/summary",
-  authorization("EQUIPMENT_REQUEST.VIEW"),
+  authorization("EQUIPMENT_MONITORING.VIEW"),
   async (req, res) => {
     try {
       const access = await getRequestAccess(req);
@@ -1590,7 +1590,7 @@ router.get(
  */
 router.get(
   "/assignments",
-  authorization("EQUIPMENT_REQUEST.VIEW"),
+  authorization("EQUIPMENT_MONITORING.VIEW"),
   async (req, res) => {
     try {
       const access = await getRequestAccess(req);

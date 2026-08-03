@@ -25,6 +25,10 @@ router
 
       const query = createRoleDetailQuery();
 
+      if (!isSystemDeveloper(req)) {
+        query.andWhere("role.code", "<>", "SYSTEM_DEVELOPER");
+      }
+
       if (search) {
         const normalizedSearch = `%${String(search).trim()}%`;
 
