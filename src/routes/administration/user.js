@@ -647,12 +647,21 @@ router
       const user = await trx("users")
         .where("uuid", req.params.uuid)
         .whereNull("deletedAt")
-        .first(["id", "uuid"]);
+        .first(["id", "uuid", "isActive"]);
 
       if (!user) {
         await trx.rollback();
 
         return res.incomplete("User tidak ditemukan.");
+      }
+
+      if (!Boolean(user.isActive)) {
+        await trx.commit();
+
+        return res.success({
+          uuid: user.uuid,
+          isActive: false,
+        });
       }
 
       const systemDeveloperRole = await trx("userRoles as userRole")
@@ -683,15 +692,16 @@ router
 
       await trx("users").where("id", user.id).update({
         isActive: false,
-        deletedAt: db.fn.now(),
         updatedAt: db.fn.now(),
       });
 
       await revokeRefreshTokens(trx, user.id);
+
       await trx.commit();
 
       return res.success({
         uuid: user.uuid,
+        isActive: false,
       });
     } catch (error) {
       await trx.rollback();
@@ -701,7 +711,6 @@ router
       return res.fail(error.message || "Failed to deactivate user.");
     }
   });
-
 async function findUserByUuid(uuid) {
   const user = await db("users as user")
     .join("companies as company", "company.id", "user.companyId")
