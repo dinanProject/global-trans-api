@@ -107,7 +107,6 @@ async function findRequestDetails(requestId, trx = db) {
       "detail.requestId",
       "detail.equipmentCategoryId",
       "detail.equipmentUnitId",
-      "detail.quantity",
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
@@ -120,7 +119,6 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
-    quantity: Number(detail.quantity),
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
@@ -309,7 +307,6 @@ function normalizePayload(payload = {}) {
         detail?.equipmentCategoryId,
       ),
       equipmentUnitId: normalizePositiveInteger(detail?.equipmentUnitId),
-      quantity: normalizePositiveInteger(detail?.quantity),
       rate: normalizeNullableDecimal(detail?.rate),
       remarks: normalizeNullableString(detail?.remarks),
     })),
@@ -369,14 +366,12 @@ function validatePayload(payload) {
         message: `Equipment category pada detail baris ${rowNumber} wajib diisi.`,
       };
     }
-
-    if (!detail.quantity) {
+    if (!detail.equipmentUnitId) {
       return {
         valid: false,
-        message: `Quantity pada detail baris ${rowNumber} wajib lebih dari 0.`,
+        message: `Equipment unit pada detail baris ${rowNumber} wajib diisi.`,
       };
     }
-
     if (detail.rate !== null && detail.rate < 0) {
       return {
         valid: false,
@@ -488,7 +483,7 @@ async function insertRequestDetails(trx, requestId, details, now) {
     requestId,
     equipmentCategoryId: detail.equipmentCategoryId,
     equipmentUnitId: detail.equipmentUnitId,
-    quantity: detail.quantity,
+    quantity: 1,
     rate: detail.rate,
     remarks: detail.remarks,
     isActive: true,
@@ -522,7 +517,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         .update({
           equipmentCategoryId: detail.equipmentCategoryId,
           equipmentUnitId: detail.equipmentUnitId,
-          quantity: detail.quantity,
+          quantity: 1,
           rate: detail.rate,
           remarks: detail.remarks,
           isActive: true,
@@ -534,7 +529,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         requestId,
         equipmentCategoryId: detail.equipmentCategoryId,
         equipmentUnitId: detail.equipmentUnitId,
-        quantity: detail.quantity,
+        quantity: 1,
         rate: detail.rate,
         remarks: detail.remarks,
         isActive: true,
@@ -1139,27 +1134,6 @@ function validateAssignmentPayload(payload) {
   return { valid: true };
 }
 
-async function validateAssignmentQuantity(trx, requestDetail) {
-  const result = await trx("equipmentAssignments")
-    .where("requestDetailId", requestDetail.id)
-    .where("isActive", true)
-    .whereNull("deletedAt")
-    .whereNotIn("statusCode", ["COMPLETED", "CANCELLED"])
-    .count({ total: "id" })
-    .first();
-
-  const activeAssignments = Number(result?.total || 0);
-
-  if (activeAssignments >= Number(requestDetail.quantity)) {
-    return {
-      valid: false,
-      message: `Jumlah assignment aktif sudah mencapai quantity request (${requestDetail.quantity}).`,
-    };
-  }
-
-  return { valid: true };
-}
-
 async function validateEquipmentSchedule(trx, payload) {
   const overlap = await trx("equipmentAssignments")
     .where("equipmentUnitId", payload.equipmentUnitId)
@@ -1186,22 +1160,21 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
     .where("requestId", requestId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .select(["id", "quantity"]);
+    .select(["id"]);
 
   if (details.length === 0) {
     return;
   }
 
   for (const detail of details) {
-    const result = await trx("equipmentAssignments")
+    const assignment = await trx("equipmentAssignments")
       .where("requestDetailId", detail.id)
       .where("isActive", true)
       .whereNull("deletedAt")
-      .whereNotIn("statusCode", "CANCELLED")
-      .count({ total: "id" })
-      .first();
+      .whereNotIn("statusCode", ["CANCELLED"])
+      .first("id");
 
-    if (Number(result?.total || 0) < Number(detail.quantity)) {
+    if (!assignment) {
       return;
     }
   }

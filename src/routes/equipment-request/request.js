@@ -181,7 +181,6 @@ router
             "erd.equipmentUnitId",
             "erd.requiredCapacityValue",
             "erd.requiredCapacityUnit",
-            "erd.quantity",
             "erd.rate",
             "erd.remarks",
 
@@ -237,8 +236,6 @@ router
               ? null
               : Number(detail.equipmentUnitCapacityValue),
           equipmentUnitCapacityUnit: detail.equipmentUnitCapacityUnit,
-
-          quantity: Number(detail.quantity || 0),
           rate:
             detail.rate === null || detail.rate === undefined
               ? null
