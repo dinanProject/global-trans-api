@@ -319,6 +319,32 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
 
         return res.incomplete(reviewedSchedule.message);
       }
+
+      const unitLock = await lockRequestEquipmentUnits(
+        trx,
+        equipmentRequest.id,
+      );
+
+      if (!unitLock.valid) {
+        await trx.rollback();
+
+        return res.incomplete(unitLock.message);
+      }
+
+      const availabilityValidation = await validateFinalRequestAvailability(
+        trx,
+        {
+          requestId: equipmentRequest.id,
+          startDate: reviewedSchedule.startDate,
+          endDate: reviewedSchedule.endDate,
+        },
+      );
+
+      if (!availabilityValidation.valid) {
+        await trx.rollback();
+
+        return res.incomplete(availabilityValidation.message);
+      }
     }
 
     if (actionCode === ACTION_SUBMIT) {
@@ -326,7 +352,12 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
         .where("requestId", equipmentRequest.id)
         .where("isActive", true)
         .whereNull("deletedAt")
-        .select(["id", "quantity"]);
+        .select([
+          "id",
+          "equipmentUnitId",
+          "requiredCapacityValue",
+          "requiredCapacityUnit",
+        ]);
 
       if (activeDetails.length === 0) {
         await trx.rollback();
@@ -336,11 +367,18 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
         );
       }
 
-      if (activeDetails.some((detail) => Number(detail.quantity) <= 0)) {
+      if (
+        activeDetails.some(
+          (detail) =>
+            !detail.equipmentUnitId ||
+            Number(detail.requiredCapacityValue) <= 0 ||
+            !detail.requiredCapacityUnit,
+        )
+      ) {
         await trx.rollback();
 
         return res.incomplete(
-          "Semua detail equipment request harus memiliki quantity lebih dari 0.",
+          "Semua detail harus memiliki equipment unit dan kebutuhan kapasitas.",
         );
       }
 
@@ -434,6 +472,130 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       error.message || "Failed to process equipment request action.",
     );
   }
+}
+
+async function validateFinalRequestAvailability(
+  trx,
+  { requestId, startDate, endDate },
+) {
+  const requestDetails = await trx("equipmentRequestDetails as detail")
+    .leftJoin(
+      "equipmentUnits as equipmentUnit",
+      "equipmentUnit.id",
+      "detail.equipmentUnitId",
+    )
+    .where("detail.requestId", requestId)
+    .where("detail.isActive", true)
+    .whereNull("detail.deletedAt")
+    .select(["detail.id", "detail.equipmentUnitId", "equipmentUnit.unitCode"]);
+
+  if (requestDetails.length === 0) {
+    return {
+      valid: false,
+      message: "Equipment request tidak memiliki detail aktif untuk disetujui.",
+    };
+  }
+
+  for (const detail of requestDetails) {
+    if (!detail.equipmentUnitId) {
+      return {
+        valid: false,
+        message: "Seluruh request detail wajib memiliki equipment unit.",
+      };
+    }
+
+    const reservedRequest = await trx("equipmentRequestDetails as otherDetail")
+      .join(
+        "equipmentRequests as otherRequest",
+        "otherRequest.id",
+        "otherDetail.requestId",
+      )
+      .where("otherDetail.equipmentUnitId", detail.equipmentUnitId)
+      .whereNot("otherRequest.id", requestId)
+      .whereIn("otherRequest.status", ["APPROVED", "ASSIGNED", "IN_PROGRESS"])
+      .where("otherRequest.isActive", true)
+      .whereNull("otherRequest.deletedAt")
+      .where("otherDetail.isActive", true)
+      .whereNull("otherDetail.deletedAt")
+      .where("otherRequest.startDate", "<=", endDate)
+      .where("otherRequest.endDate", ">=", startDate)
+      .first([
+        "otherRequest.requestNo",
+        "otherRequest.startDate",
+        "otherRequest.endDate",
+        "otherRequest.status",
+      ]);
+
+    if (reservedRequest) {
+      return {
+        valid: false,
+        message:
+          `Equipment unit ${detail.unitCode} sudah digunakan oleh ` +
+          `request ${reservedRequest.requestNo} pada periode ` +
+          `${reservedRequest.startDate} sampai ` +
+          `${reservedRequest.endDate}.`,
+      };
+    }
+
+    const activeAssignment = await trx("equipmentAssignments as assignment")
+      .leftJoin(
+        "equipmentRequestDetails as assignmentDetail",
+        "assignmentDetail.id",
+        "assignment.requestDetailId",
+      )
+      .where("assignment.equipmentUnitId", detail.equipmentUnitId)
+      .whereNot("assignmentDetail.requestId", requestId)
+      .where("assignment.isActive", true)
+      .whereNull("assignment.deletedAt")
+      .whereNotIn("assignment.statusCode", "CANCELLED")
+      .where("assignment.plannedStartDate", "<=", endDate)
+      .andWhere((builder) => {
+        builder.whereNull("assignment.actualEndDate").orWhereRaw(
+          `
+              GREATEST(
+                assignment.plannedEndDate,
+                assignment.actualEndDate
+              ) >= ?
+            `,
+          [startDate],
+        );
+      })
+      .first([
+        "assignment.statusCode",
+        "assignment.plannedEndDate",
+        "assignment.actualEndDate",
+      ]);
+
+    if (activeAssignment) {
+      if (!activeAssignment.actualEndDate) {
+        return {
+          valid: false,
+          message:
+            `Equipment unit ${detail.unitCode} masih memiliki ` +
+            "assignment yang belum diselesaikan.",
+        };
+      }
+
+      const plannedEndDate = new Date(activeAssignment.plannedEndDate);
+      const actualEndDate = new Date(activeAssignment.actualEndDate);
+
+      const availableAt =
+        actualEndDate > plannedEndDate
+          ? activeAssignment.actualEndDate
+          : activeAssignment.plannedEndDate;
+
+      return {
+        valid: false,
+        message:
+          `Equipment unit ${detail.unitCode} belum tersedia. ` +
+          `Unit baru dapat digunakan setelah ${availableAt}.`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+  };
 }
 
 async function findRequestByUuid(uuid, access, trx = db) {

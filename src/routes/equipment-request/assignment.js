@@ -19,12 +19,12 @@ const HOLDER_COMPANY_TYPE = 1;
 const STATUS_APPROVED = "APPROVED";
 const STATUS_ASSIGNED = "ASSIGNED";
 const STATUS_IN_PROGRESS = "IN_PROGRESS";
+const STATUS_PARTIALLY_COMPLETED = "PARTIALLY_COMPLETED";
 const STATUS_COMPLETED = "COMPLETED";
 
 const ASSIGNMENT_STATUS_ASSIGNED = "ASSIGNED";
 const ASSIGNMENT_STATUS_IN_OPERATION = "IN_OPERATION";
 const ASSIGNMENT_STATUS_COMPLETED = "COMPLETED";
-const ASSIGNMENT_STATUS_REPLACED = "REPLACED";
 const ASSIGNMENT_STATUS_CANCELLED = "CANCELLED";
 
 router.use(authentication);
@@ -120,7 +120,6 @@ async function findRequestDetails(requestId, trx = db) {
       "detail.requestId",
       "detail.equipmentCategoryId",
       "detail.equipmentUnitId",
-      "detail.quantity",
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
@@ -133,7 +132,6 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
-    quantity: Number(detail.quantity),
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
@@ -491,7 +489,6 @@ async function insertRequestDetails(trx, requestId, details, now) {
     requestId,
     equipmentCategoryId: detail.equipmentCategoryId,
     equipmentUnitId: detail.equipmentUnitId,
-    quantity: detail.quantity,
     rate: detail.rate,
     remarks: detail.remarks,
     isActive: true,
@@ -967,21 +964,50 @@ function normalizeDate(value) {
 
   const normalizedValue = String(value).trim();
 
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedValue)) {
+  const match = normalizedValue.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?$/,
+  );
+
+  if (!match) {
     return null;
   }
 
-  const date = new Date(`${normalizedValue}T00:00:00Z`);
+  const [, year, month, day, hour, minute, second = "00"] = match;
 
-  if (Number.isNaN(date.getTime())) {
+  const yearNumber = Number(year);
+  const monthNumber = Number(month);
+  const dayNumber = Number(day);
+  const hourNumber = Number(hour);
+  const minuteNumber = Number(minute);
+  const secondNumber = Number(second);
+
+  if (hourNumber > 23 || minuteNumber > 59 || secondNumber > 59) {
     return null;
   }
 
-  if (date.toISOString().slice(0, 10) !== normalizedValue) {
+  const date = new Date(
+    Date.UTC(
+      yearNumber,
+      monthNumber - 1,
+      dayNumber,
+      hourNumber,
+      minuteNumber,
+      secondNumber,
+    ),
+  );
+
+  if (
+    date.getUTCFullYear() !== yearNumber ||
+    date.getUTCMonth() + 1 !== monthNumber ||
+    date.getUTCDate() !== dayNumber ||
+    date.getUTCHours() !== hourNumber ||
+    date.getUTCMinutes() !== minuteNumber ||
+    date.getUTCSeconds() !== secondNumber
+  ) {
     return null;
   }
 
-  return normalizedValue;
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
 }
 
 function parseBooleanQuery(value) {
@@ -1062,10 +1088,10 @@ router.post(
       /*
        * Assignment hanya dapat ditambahkan setelah approval final.
        *
-       * Request tetap APPROVED selama jumlah equipment assignment
-       * belum memenuhi seluruh quantity pada request detail.
+       * Satu request detail mewakili satu physical equipment unit
+       * dan hanya dapat memiliki satu assignment aktif.
        *
-       * Setelah seluruh kebutuhan terpenuhi,
+       * Setelah seluruh request detail memiliki assignment aktif,
        * synchronizeRequestAssignmentStatus akan mengubah status
        * request menjadi ASSIGNED.
        */
@@ -1103,12 +1129,69 @@ router.post(
         .where("uuid", payload.equipmentUnitUuid)
         .where("isActive", true)
         .whereNull("deletedAt")
-        .first(["id", "uuid"]);
+        .first([
+          "id",
+          "uuid",
+          "categoryId",
+          "unitName",
+          "unitCode",
+          "assetNumber",
+          "modelNumber",
+          "plateNumber",
+          "capacityValue",
+          "capacityUnit",
+        ]);
 
       if (!equipmentUnit) {
         await trx.rollback();
 
         return res.incomplete("Equipment unit tidak valid atau tidak aktif.");
+      }
+
+      if (Number(requestDetail.equipmentUnitId) !== Number(equipmentUnit.id)) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Equipment unit assignment harus sesuai dengan unit yang telah disetujui pada request detail.",
+        );
+      }
+
+      if (
+        Number(requestDetail.equipmentCategoryId) !==
+        Number(equipmentUnit.categoryId)
+      ) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Equipment unit tidak sesuai dengan category pada request detail.",
+        );
+      }
+
+      if (
+        String(equipmentUnit.capacityUnit || "").toUpperCase() !==
+        String(requestDetail.requiredCapacityUnit || "").toUpperCase()
+      ) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Satuan kapasitas unit ${equipmentUnit.unitCode} ` +
+            "tidak sesuai dengan kebutuhan request.",
+        );
+      }
+
+      if (
+        Number(equipmentUnit.capacityValue) <
+        Number(requestDetail.requiredCapacityValue)
+      ) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Kapasitas unit ${equipmentUnit.unitCode} tidak mencukupi. ` +
+            `Kapasitas unit ${Number(equipmentUnit.capacityValue)} ` +
+            `${equipmentUnit.capacityUnit}, kebutuhan ` +
+            `${Number(requestDetail.requiredCapacityValue)} ` +
+            `${requestDetail.requiredCapacityUnit}.`,
+        );
       }
 
       const quantityValidation = await validateAssignmentQuantity(
@@ -1149,9 +1232,7 @@ router.post(
         actualEndDate: null,
         assignedBy: access.user.id,
         assignedAt: now,
-        replacedAssignmentId: null,
-        replacedByAssignmentId: null,
-        replacementReason: null,
+
         releasedBy: null,
         releasedAt: null,
         notes: payload.notes,
@@ -1200,181 +1281,6 @@ router.post(
   },
 );
 
-/**
- * POST /equipment-request/:uuid/:assignmentUuid/replace
- */
-router.post(
-  "/:uuid/:assignmentUuid/replace",
-  authorization("EQUIPMENT_REQUEST.ASSIGN"),
-  async (req, res) => {
-    const trx = await db.transaction();
-
-    try {
-      const access = await getRequestAccess(req);
-
-      const equipmentRequest = await findRequestForUpdate(
-        trx,
-        req.params.uuid,
-        access,
-      );
-
-      if (!equipmentRequest) {
-        await trx.rollback();
-
-        return res.incomplete("Equipment request tidak ditemukan.");
-      }
-
-      const existingAssignment = await trx("equipmentAssignments")
-        .where("uuid", req.params.assignmentUuid)
-        .where("requestId", equipmentRequest.id)
-        .where("isActive", true)
-        .whereNull("deletedAt")
-        .first();
-
-      if (!existingAssignment) {
-        await trx.rollback();
-
-        return res.incomplete("Equipment assignment tidak ditemukan.");
-      }
-
-      if (
-        [
-          ASSIGNMENT_STATUS_COMPLETED,
-          ASSIGNMENT_STATUS_REPLACED,
-          ASSIGNMENT_STATUS_CANCELLED,
-        ].includes(existingAssignment.statusCode)
-      ) {
-        await trx.rollback();
-
-        return res.incomplete(
-          `Assignment berstatus ${existingAssignment.statusCode} tidak dapat diganti.`,
-        );
-      }
-
-      const equipmentUnitUuid = normalizeRequiredString(
-        req.body?.equipmentUnitUuid,
-      );
-
-      const replacementReason = normalizeNullableString(
-        req.body?.replacementReason,
-      );
-
-      if (!equipmentUnitUuid) {
-        await trx.rollback();
-
-        return res.incomplete("Equipment unit pengganti wajib dipilih.");
-      }
-
-      if (!replacementReason) {
-        await trx.rollback();
-
-        return res.incomplete("Replacement reason wajib diisi.");
-      }
-
-      const equipmentUnit = await trx("equipmentUnits")
-        .where("uuid", equipmentUnitUuid)
-        .where("isActive", true)
-        .whereNull("deletedAt")
-        .first(["id", "uuid"]);
-
-      if (!equipmentUnit) {
-        await trx.rollback();
-
-        return res.incomplete(
-          "Equipment unit pengganti tidak valid atau tidak aktif.",
-        );
-      }
-
-      if (equipmentUnit.id === existingAssignment.equipmentUnitId) {
-        await trx.rollback();
-
-        return res.incomplete(
-          "Equipment unit pengganti harus berbeda dari equipment sebelumnya.",
-        );
-      }
-
-      const scheduleValidation = await validateEquipmentSchedule(trx, {
-        equipmentUnitId: equipmentUnit.id,
-        plannedStartDate: existingAssignment.plannedStartDate,
-        plannedEndDate: existingAssignment.plannedEndDate,
-      });
-
-      if (!scheduleValidation.valid) {
-        await trx.rollback();
-
-        return res.incomplete(scheduleValidation.message);
-      }
-
-      const now = db.fn.now();
-      const replacementUuid = randomUUID();
-
-      const insertResult = await trx("equipmentAssignments").insert({
-        uuid: replacementUuid,
-        requestId: equipmentRequest.id,
-        requestDetailId: existingAssignment.requestDetailId,
-        equipmentUnitId: equipmentUnit.id,
-        statusCode: ASSIGNMENT_STATUS_ASSIGNED,
-        plannedStartDate: existingAssignment.plannedStartDate,
-        plannedEndDate: existingAssignment.plannedEndDate,
-        actualStartDate: null,
-        actualEndDate: null,
-        assignedBy: access.user.id,
-        assignedAt: now,
-        replacedAssignmentId: existingAssignment.id,
-        replacedByAssignmentId: null,
-        replacementReason,
-        releasedBy: null,
-        releasedAt: null,
-        notes: normalizeNullableString(req.body?.notes),
-        isActive: true,
-        createdAt: now,
-        updatedAt: now,
-        deletedAt: null,
-      });
-
-      const replacementId = Array.isArray(insertResult)
-        ? insertResult[0]
-        : insertResult;
-
-      await trx("equipmentAssignments")
-        .where("id", existingAssignment.id)
-        .update({
-          statusCode: ASSIGNMENT_STATUS_REPLACED,
-          replacedByAssignmentId: replacementId,
-          replacementReason,
-          releasedBy: access.user.id,
-          releasedAt: now,
-          updatedAt: now,
-        });
-
-      await insertRequestHistory(trx, {
-        requestId: equipmentRequest.id,
-        activity: "REPLACE_EQUIPMENT",
-        description: `Assignment ${existingAssignment.uuid} diganti dengan equipment unit ${equipmentUnit.uuid}. Alasan: ${replacementReason}`,
-        userId: access.user.id,
-        createdAt: now,
-      });
-
-      await trx.commit();
-
-      const replacement = await findAssignmentByUuid(replacementUuid);
-
-      return res.success(replacement);
-    } catch (error) {
-      await trx.rollback();
-
-      console.error(
-        "POST /equipment-request/:uuid/:assignmentUuid/replace error:",
-        error,
-      );
-
-      return res.fail(
-        error.message || "Failed to replace equipment assignment.",
-      );
-    }
-  },
-);
-
 router.post(
   "/:uuid/:assignmentUuid/start",
   authorization("EQUIPMENT_REQUEST.START_OPERATION"),
@@ -1414,6 +1320,7 @@ async function updateAssignmentOperation(req, res, destinationStatus) {
       .where("requestId", equipmentRequest.id)
       .where("isActive", true)
       .whereNull("deletedAt")
+      .forUpdate()
       .first();
 
     if (!assignment) {
@@ -1440,7 +1347,9 @@ async function updateAssignmentOperation(req, res, destinationStatus) {
       await trx.rollback();
 
       return res.incomplete(
-        `Assignment berstatus ${assignment.statusCode} tidak dapat diselesaikan.`,
+        assignment.statusCode === ASSIGNMENT_STATUS_COMPLETED
+          ? "Equipment assignment sudah diselesaikan."
+          : `Assignment berstatus ${assignment.statusCode} tidak dapat diselesaikan.`,
       );
     }
 
@@ -1557,6 +1466,11 @@ async function findAssignments(requestId, trx = db) {
       "detail.uuid as requestDetailUuid",
       "assignment.equipmentUnitId",
       "equipmentUnit.uuid as equipmentUnitUuid",
+      "equipmentUnit.unitName as equipmentUnitName",
+      "equipmentUnit.unitCode as equipmentUnitCode",
+      "equipmentUnit.assetNumber as equipmentUnitAssetNumber",
+      "equipmentUnit.modelNumber as equipmentUnitModelNumber",
+      "equipmentUnit.plateNumber as equipmentUnitPlateNumber",
       "assignment.statusCode",
       "assignment.plannedStartDate",
       "assignment.plannedEndDate",
@@ -1566,9 +1480,6 @@ async function findAssignments(requestId, trx = db) {
       "assignedUser.uuid as assignedByUuid",
       "assignedUser.fullName as assignedByName",
       "assignment.assignedAt",
-      "assignment.replacedAssignmentId",
-      "assignment.replacedByAssignmentId",
-      "assignment.replacementReason",
       "assignment.releasedBy",
       "releasedUser.uuid as releasedByUuid",
       "releasedUser.fullName as releasedByName",
@@ -1622,6 +1533,11 @@ async function findAssignmentByUuid(uuid, trx = db) {
       "detail.uuid as requestDetailUuid",
       "assignment.equipmentUnitId",
       "equipmentUnit.uuid as equipmentUnitUuid",
+      "equipmentUnit.unitName as equipmentUnitName",
+      "equipmentUnit.unitCode as equipmentUnitCode",
+      "equipmentUnit.assetNumber as equipmentUnitAssetNumber",
+      "equipmentUnit.modelNumber as equipmentUnitModelNumber",
+      "equipmentUnit.plateNumber as equipmentUnitPlateNumber",
       "assignment.statusCode",
       "assignment.plannedStartDate",
       "assignment.plannedEndDate",
@@ -1631,9 +1547,7 @@ async function findAssignmentByUuid(uuid, trx = db) {
       "assignedUser.uuid as assignedByUuid",
       "assignedUser.fullName as assignedByName",
       "assignment.assignedAt",
-      "assignment.replacedAssignmentId",
-      "assignment.replacedByAssignmentId",
-      "assignment.replacementReason",
+
       "assignment.releasedBy",
       "releasedUser.uuid as releasedByUuid",
       "releasedUser.fullName as releasedByName",
@@ -1687,11 +1601,11 @@ function validateAssignmentPayload(payload) {
     };
   }
 
-  if (payload.plannedEndDate < payload.plannedStartDate) {
+  if (payload.plannedEndDate <= payload.plannedStartDate) {
     return {
       valid: false,
       message:
-        "Planned end date tidak boleh lebih kecil dari planned start date.",
+        "Planned end date dan waktu harus lebih besar dari planned start date dan waktu.",
     };
   }
 
@@ -1701,26 +1615,17 @@ function validateAssignmentPayload(payload) {
 }
 
 async function validateAssignmentQuantity(trx, requestDetail) {
-  const result = await trx("equipmentAssignments")
+  const existingAssignment = await trx("equipmentAssignments")
     .where("requestDetailId", requestDetail.id)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", [
-      ASSIGNMENT_STATUS_COMPLETED,
-      ASSIGNMENT_STATUS_REPLACED,
-      ASSIGNMENT_STATUS_CANCELLED,
-    ])
-    .count({
-      total: "id",
-    })
-    .first();
+    .whereNotIn("statusCode", ASSIGNMENT_STATUS_CANCELLED)
+    .first(["id", "uuid", "statusCode"]);
 
-  const activeAssignments = Number(result?.total || 0);
-
-  if (activeAssignments >= Number(requestDetail.quantity)) {
+  if (existingAssignment) {
     return {
       valid: false,
-      message: `Jumlah assignment aktif sudah mencapai quantity request (${requestDetail.quantity}).`,
+      message: "Request detail ini sudah memiliki equipment assignment.",
     };
   }
 
@@ -1734,20 +1639,47 @@ async function validateEquipmentSchedule(trx, payload) {
     .where("equipmentUnitId", payload.equipmentUnitId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", [
-      ASSIGNMENT_STATUS_COMPLETED,
-      ASSIGNMENT_STATUS_REPLACED,
-      ASSIGNMENT_STATUS_CANCELLED,
-    ])
+    .whereNotIn("statusCode", ASSIGNMENT_STATUS_CANCELLED)
     .where("plannedStartDate", "<=", payload.plannedEndDate)
-    .where("plannedEndDate", ">=", payload.plannedStartDate)
-    .first("id");
+    .andWhere((builder) => {
+      builder.whereNull("actualEndDate").orWhereRaw(
+        `
+            GREATEST(
+              plannedEndDate,
+              actualEndDate
+            ) >= ?
+          `,
+        [payload.plannedStartDate],
+      );
+    })
+    .first([
+      "id",
+      "uuid",
+      "statusCode",
+      "plannedStartDate",
+      "plannedEndDate",
+      "actualEndDate",
+    ]);
 
   if (overlap) {
+    if (!overlap.actualEndDate) {
+      return {
+        valid: false,
+        message:
+          "Equipment unit masih memiliki assignment yang belum diselesaikan.",
+      };
+    }
+
+    const availableAt =
+      overlap.actualEndDate > overlap.plannedEndDate
+        ? overlap.actualEndDate
+        : overlap.plannedEndDate;
+
     return {
       valid: false,
       message:
-        "Equipment unit sudah memiliki assignment aktif pada periode tersebut.",
+        `Equipment unit belum tersedia pada periode tersebut. ` +
+        `Unit baru dapat digunakan setelah ${availableAt}.`,
     };
   }
 
@@ -1774,7 +1706,7 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
     .where("requestId", requestId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .select(["id", "quantity"]);
+    .select(["id"]);
 
   if (details.length === 0) {
     return {
@@ -1785,18 +1717,14 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
   }
 
   for (const detail of details) {
-    const result = await trx("equipmentAssignments")
+    const assignment = await trx("equipmentAssignments")
       .where("requestDetailId", detail.id)
       .where("isActive", true)
       .whereNull("deletedAt")
-      .whereNotIn("statusCode", [
-        ASSIGNMENT_STATUS_REPLACED,
-        ASSIGNMENT_STATUS_CANCELLED,
-      ])
-      .count({ total: "id" })
-      .first();
+      .whereNotIn("statusCode", ASSIGNMENT_STATUS_CANCELLED)
+      .first("id");
 
-    if (Number(result?.total || 0) < Number(detail.quantity)) {
+    if (!assignment) {
       return {
         statusChanged: false,
         previousStatusCode: request.status,
@@ -1840,10 +1768,7 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
     .where("requestId", requestId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", [
-      ASSIGNMENT_STATUS_REPLACED,
-      ASSIGNMENT_STATUS_CANCELLED,
-    ])
+    .whereNotIn("statusCode", [ASSIGNMENT_STATUS_CANCELLED])
     .select(["statusCode"]);
 
   if (assignments.length === 0) {
@@ -1854,54 +1779,40 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
     };
   }
 
-  const allCompleted = assignments.every(
+  const completedCount = assignments.filter(
     (assignment) => assignment.statusCode === ASSIGNMENT_STATUS_COMPLETED,
-  );
-
-  if (allCompleted) {
-    if (request.status === STATUS_COMPLETED) {
-      return {
-        statusChanged: false,
-        previousStatusCode: STATUS_COMPLETED,
-        statusCode: STATUS_COMPLETED,
-      };
-    }
-
-    await updateRequestStatusIfAvailable(trx, requestId, STATUS_COMPLETED);
-
-    return {
-      statusChanged: true,
-      previousStatusCode: request.status,
-      statusCode: STATUS_COMPLETED,
-    };
-  }
+  ).length;
 
   const hasInOperation = assignments.some(
     (assignment) => assignment.statusCode === ASSIGNMENT_STATUS_IN_OPERATION,
   );
 
-  if (hasInOperation) {
-    if (request.status === STATUS_IN_PROGRESS) {
-      return {
-        statusChanged: false,
-        previousStatusCode: STATUS_IN_PROGRESS,
-        statusCode: STATUS_IN_PROGRESS,
-      };
-    }
+  let nextStatusCode = request.status;
 
-    await updateRequestStatusIfAvailable(trx, requestId, STATUS_IN_PROGRESS);
+  if (completedCount === assignments.length) {
+    nextStatusCode = STATUS_COMPLETED;
+  } else if (completedCount > 0) {
+    nextStatusCode = STATUS_PARTIALLY_COMPLETED;
+  } else if (hasInOperation) {
+    nextStatusCode = STATUS_IN_PROGRESS;
+  } else {
+    nextStatusCode = STATUS_ASSIGNED;
+  }
 
+  if (request.status === nextStatusCode) {
     return {
-      statusChanged: true,
+      statusChanged: false,
       previousStatusCode: request.status,
-      statusCode: STATUS_IN_PROGRESS,
+      statusCode: request.status,
     };
   }
 
+  await updateRequestStatusIfAvailable(trx, requestId, nextStatusCode);
+
   return {
-    statusChanged: false,
+    statusChanged: true,
     previousStatusCode: request.status,
-    statusCode: request.status,
+    statusCode: nextStatusCode,
   };
 }
 

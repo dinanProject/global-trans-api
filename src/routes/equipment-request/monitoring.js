@@ -1031,9 +1031,6 @@ async function findAssignments(requestId, trx = db) {
       "assignedUser.uuid as assignedByUuid",
       "assignedUser.fullName as assignedByName",
       "assignment.assignedAt",
-      "assignment.replacedAssignmentId",
-      "assignment.replacedByAssignmentId",
-      "assignment.replacementReason",
       "assignment.releasedBy",
       "releasedUser.uuid as releasedByUuid",
       "releasedUser.fullName as releasedByName",
@@ -1090,9 +1087,6 @@ async function findAssignmentByUuid(uuid, trx = db) {
       "assignedUser.uuid as assignedByUuid",
       "assignedUser.fullName as assignedByName",
       "assignment.assignedAt",
-      "assignment.replacedAssignmentId",
-      "assignment.replacedByAssignmentId",
-      "assignment.replacementReason",
       "assignment.releasedBy",
       "releasedUser.uuid as releasedByUuid",
       "releasedUser.fullName as releasedByName",
@@ -1150,7 +1144,7 @@ async function validateAssignmentQuantity(trx, requestDetail) {
     .where("requestDetailId", requestDetail.id)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", ["COMPLETED", "REPLACED", "CANCELLED"])
+    .whereNotIn("statusCode", ["COMPLETED", "CANCELLED"])
     .count({ total: "id" })
     .first();
 
@@ -1171,7 +1165,7 @@ async function validateEquipmentSchedule(trx, payload) {
     .where("equipmentUnitId", payload.equipmentUnitId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", ["COMPLETED", "REPLACED", "CANCELLED"])
+    .whereNotIn("statusCode", ["COMPLETED", "CANCELLED"])
     .where("plannedStartDate", "<=", payload.plannedEndDate)
     .where("plannedEndDate", ">=", payload.plannedStartDate)
     .first("id");
@@ -1203,7 +1197,7 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
       .where("requestDetailId", detail.id)
       .where("isActive", true)
       .whereNull("deletedAt")
-      .whereNotIn("statusCode", ["REPLACED", "CANCELLED"])
+      .whereNotIn("statusCode", "CANCELLED")
       .count({ total: "id" })
       .first();
 
@@ -1220,25 +1214,40 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
     .where("requestId", requestId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", ["REPLACED", "CANCELLED"])
+    .whereNot("statusCode", "CANCELLED")
     .select(["statusCode"]);
 
   if (assignments.length === 0) {
     return;
   }
 
-  if (
-    assignments.every((assignment) => assignment.statusCode === "COMPLETED")
-  ) {
+  const completedCount = assignments.filter(
+    (assignment) => assignment.statusCode === "COMPLETED",
+  ).length;
+
+  const hasInOperation = assignments.some(
+    (assignment) => assignment.statusCode === "IN_OPERATION",
+  );
+
+  if (completedCount === assignments.length) {
     await updateRequestStatusIfAvailable(trx, requestId, "COMPLETED");
+
     return;
   }
 
-  if (
-    assignments.some((assignment) => assignment.statusCode === "IN_OPERATION")
-  ) {
-    await updateRequestStatusIfAvailable(trx, requestId, "IN_PROGRESS");
+  if (completedCount > 0) {
+    await updateRequestStatusIfAvailable(trx, requestId, "PARTIALLY_COMPLETED");
+
+    return;
   }
+
+  if (hasInOperation) {
+    await updateRequestStatusIfAvailable(trx, requestId, "IN_PROGRESS");
+
+    return;
+  }
+
+  await updateRequestStatusIfAvailable(trx, requestId, "ASSIGNED");
 }
 
 async function updateRequestStatusIfAvailable(trx, requestId, statusCode) {
@@ -1554,11 +1563,17 @@ router.get(
             .whereRaw("activeAssignment.equipmentUnitId = equipmentUnit.id")
             .where("activeAssignment.isActive", true)
             .whereNull("activeAssignment.deletedAt")
-            .whereNull("activeAssignment.actualEndDate")
-            .whereIn("activeAssignment.statusCode", [
-              "ASSIGNED",
-              "IN_OPERATION",
-            ]);
+            .whereNot("activeAssignment.statusCode", "CANCELLED")
+            .andWhere((builder) => {
+              builder.whereNull("activeAssignment.actualEndDate").orWhereRaw(
+                `
+              GREATEST(
+                activeAssignment.plannedEndDate,
+                activeAssignment.actualEndDate
+              ) >= NOW()
+            `,
+              );
+            });
         })
         .count({ total: "equipmentUnit.id" })
         .first();

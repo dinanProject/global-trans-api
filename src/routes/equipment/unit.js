@@ -108,6 +108,19 @@ router
         );
       }
 
+      const capacityUnitLookup = await findCapacityUnitLookup(
+        trx,
+        payload.capacityUnit,
+      );
+
+      if (!capacityUnitLookup) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Equipment capacity unit "${payload.capacityUnit}" tidak valid atau tidak aktif.`,
+        );
+      }
+
       const duplicateUnitCode = await trx("equipmentUnits")
         .whereRaw("UPPER(unitCode) = ?", [payload.unitCode])
         .whereNull("deletedAt")
@@ -166,6 +179,8 @@ router
         assetNumber: payload.assetNumber,
         modelNumber: payload.modelNumber,
         plateNumber: payload.plateNumber,
+        capacityValue: payload.capacityValue,
+        capacityUnit: capacityUnitLookup.lookupCode,
         remarks: payload.remarks,
         isActive: payload.isActive,
         createdAt: now,
@@ -233,6 +248,19 @@ router
         );
       }
 
+      const capacityUnitLookup = await findCapacityUnitLookup(
+        trx,
+        payload.capacityUnit,
+      );
+
+      if (!capacityUnitLookup) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Equipment capacity unit "${payload.capacityUnit}" tidak valid atau tidak aktif.`,
+        );
+      }
+
       const duplicateUnitCode = await trx("equipmentUnits")
         .whereRaw("UPPER(unitCode) = ?", [payload.unitCode])
         .whereNot("id", existingUnit.id)
@@ -290,6 +318,8 @@ router
         assetNumber: payload.assetNumber,
         modelNumber: payload.modelNumber,
         plateNumber: payload.plateNumber,
+        capacityValue: payload.capacityValue,
+        capacityUnit: capacityUnitLookup.lookupCode,
         remarks: payload.remarks,
         isActive: payload.isActive,
         updatedAt: db.fn.now(),
@@ -361,6 +391,12 @@ function createEquipmentUnitQuery(database = db) {
       "category.id",
       "unit.categoryId",
     )
+    .leftJoin("sysLookups as capacityLookup", function () {
+      this.on("capacityLookup.lookupCode", "=", "unit.capacityUnit")
+        .andOnVal("capacityLookup.lookupGroup", "=", "equipment_capacity_unit")
+        .andOnVal("capacityLookup.isActive", "=", 1)
+        .andOnNull("capacityLookup.deletedAt");
+    })
     .select([
       "unit.id",
       "unit.uuid",
@@ -374,6 +410,10 @@ function createEquipmentUnitQuery(database = db) {
       "unit.assetNumber",
       "unit.modelNumber",
       "unit.plateNumber",
+      "unit.capacityValue",
+      "unit.capacityUnit",
+      "capacityLookup.lookupValue as capacityUnitName",
+      "capacityLookup.lookupAlias as capacityUnitAlias",
       "unit.remarks",
       "unit.isActive",
       "unit.createdAt",
@@ -386,6 +426,15 @@ async function findEquipmentUnitByUuid(uuid) {
   return createEquipmentUnitQuery().where("unit.uuid", uuid).first();
 }
 
+async function findCapacityUnitLookup(database, capacityUnit) {
+  return database("sysLookups")
+    .where("lookupGroup", "equipment_capacity_unit")
+    .whereRaw("UPPER(lookupCode) = ?", [capacityUnit])
+    .where("isActive", 1)
+    .whereNull("deletedAt")
+    .first(["lookupId", "lookupCode", "lookupValue", "lookupAlias"]);
+}
+
 function normalizePayload(payload = {}) {
   return {
     categoryUuid: normalizeRequiredString(payload.categoryUuid),
@@ -394,6 +443,8 @@ function normalizePayload(payload = {}) {
     assetNumber: normalizeNullableString(payload.assetNumber),
     modelNumber: normalizeNullableString(payload.modelNumber),
     plateNumber: normalizeNullableString(payload.plateNumber),
+    capacityValue: normalizePositiveDecimal(payload.capacityValue),
+    capacityUnit: normalizeRequiredString(payload.capacityUnit).toUpperCase(),
     remarks: normalizeNullableString(payload.remarks),
     isActive: normalizeBoolean(payload.isActive, true),
   };
@@ -464,6 +515,27 @@ function validatePayload(payload) {
     };
   }
 
+  if (!payload.capacityValue) {
+    return {
+      valid: false,
+      message: "Equipment capacity value wajib lebih dari 0.",
+    };
+  }
+
+  if (!payload.capacityUnit) {
+    return {
+      valid: false,
+      message: "Equipment capacity unit wajib dipilih.",
+    };
+  }
+
+  if (payload.capacityUnit.length > 50) {
+    return {
+      valid: false,
+      message: "Equipment capacity unit maksimal 50 karakter.",
+    };
+  }
+
   if (payload.remarks && payload.remarks.length > 500) {
     return {
       valid: false,
@@ -492,6 +564,20 @@ function normalizeNullableString(value) {
   const normalizedValue = String(value).trim();
 
   return normalizedValue || null;
+}
+
+function normalizePositiveDecimal(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const normalizedValue = Number(value);
+
+  if (!Number.isFinite(normalizedValue) || normalizedValue <= 0) {
+    return null;
+  }
+
+  return normalizedValue;
 }
 
 function normalizeBoolean(value, defaultValue = false) {
