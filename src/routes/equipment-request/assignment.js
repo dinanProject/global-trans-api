@@ -310,7 +310,6 @@ function normalizePayload(payload = {}) {
         detail?.equipmentCategoryId,
       ),
       equipmentUnitId: normalizePositiveInteger(detail?.equipmentUnitId),
-      quantity: normalizePositiveInteger(detail?.quantity),
       rate: normalizeNullableDecimal(detail?.rate),
       remarks: normalizeNullableString(detail?.remarks),
     })),
@@ -368,13 +367,6 @@ function validatePayload(payload) {
       return {
         valid: false,
         message: `Equipment category pada detail baris ${rowNumber} wajib diisi.`,
-      };
-    }
-
-    if (!detail.quantity) {
-      return {
-        valid: false,
-        message: `Quantity pada detail baris ${rowNumber} wajib lebih dari 0.`,
       };
     }
 
@@ -522,7 +514,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         .update({
           equipmentCategoryId: detail.equipmentCategoryId,
           equipmentUnitId: detail.equipmentUnitId,
-          quantity: detail.quantity,
+          quantity: 1,
           rate: detail.rate,
           remarks: detail.remarks,
           isActive: true,
@@ -534,7 +526,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         requestId,
         equipmentCategoryId: detail.equipmentCategoryId,
         equipmentUnitId: detail.equipmentUnitId,
-        quantity: detail.quantity,
+        quantity: 1,
         rate: detail.rate,
         remarks: detail.remarks,
         isActive: true,
@@ -1194,17 +1186,6 @@ router.post(
         );
       }
 
-      const quantityValidation = await validateAssignmentQuantity(
-        trx,
-        requestDetail,
-      );
-
-      if (!quantityValidation.valid) {
-        await trx.rollback();
-
-        return res.incomplete(quantityValidation.message);
-      }
-
       const scheduleValidation = await validateEquipmentSchedule(trx, {
         equipmentUnitId: equipmentUnit.id,
         plannedStartDate: payload.plannedStartDate,
@@ -1606,26 +1587,6 @@ function validateAssignmentPayload(payload) {
       valid: false,
       message:
         "Planned end date dan waktu harus lebih besar dari planned start date dan waktu.",
-    };
-  }
-
-  return {
-    valid: true,
-  };
-}
-
-async function validateAssignmentQuantity(trx, requestDetail) {
-  const existingAssignment = await trx("equipmentAssignments")
-    .where("requestDetailId", requestDetail.id)
-    .where("isActive", true)
-    .whereNull("deletedAt")
-    .whereNotIn("statusCode", ASSIGNMENT_STATUS_CANCELLED)
-    .first(["id", "uuid", "statusCode"]);
-
-  if (existingAssignment) {
-    return {
-      valid: false,
-      message: "Request detail ini sudah memiliki equipment assignment.",
     };
   }
 
