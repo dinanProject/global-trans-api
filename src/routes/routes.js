@@ -24,5 +24,6 @@ route.use("/equipment-request", require("./equipment-request"));
 
 route.use("/file-attachment", require("./file-attachment/file-attachment"));
 route.use("/home", require("./home/dashboard"));
+route.use("/login-log", require("./log/login-log"));
 
 module.exports = route;

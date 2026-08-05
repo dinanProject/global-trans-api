@@ -11,17 +11,153 @@ const authentication = require("../../lib/authentication");
 const tokenHelper = require("../../lib/token");
 const { getUserAccess } = require("../../lib/user-access");
 const { getUserMenus } = require("../../lib/user-menu");
+const {
+  LOGIN_STATUS,
+  LOGIN_FAILURE_REASON,
+  createLoginLogSafely,
+} = require("../log/login-log");
 
 route
+  // .post("/login", async (req, res, next) => {
+  //   try {
+  //     const { email, password } = req.body;
+
+  //     if (!email || !password) {
+  //       return res.incomplete("Email and password are required.");
+  //     }
+
+  //     const user = await db("users")
+  //       .where({
+  //         email,
+  //         isActive: true,
+  //       })
+  //       .whereNull("deletedAt")
+  //       .first();
+
+  //     if (!user) {
+  //       return res.unauthenticated("Invalid email or password.");
+  //     }
+
+  //     const isValidPassword = await bcrypt.compare(password, user.password);
+
+  //     if (!isValidPassword) {
+  //       return res.unauthenticated("Invalid email or password.");
+  //     }
+
+  //     await db("refreshTokens")
+  //       .where({
+  //         userId: user.id,
+  //       })
+  //       .whereNull("revokedAt")
+  //       .update({
+  //         revokedAt: new Date(),
+  //       });
+
+  //     const accessToken = jwt.signAccessToken({
+  //       userId: user.id,
+  //       uuid: user.uuid,
+  //       email: user.email,
+  //     });
+
+  //     const refreshToken = jwt.signRefreshToken({
+  //       userId: user.id,
+  //       uuid: user.uuid,
+  //     });
+
+  //     const refreshPayload = jwt.verifyRefreshToken(refreshToken);
+
+  //     await db("refreshTokens").insert({
+  //       uuid: crypto.randomUUID(),
+  //       jti: refreshPayload.jti,
+  //       userId: user.id,
+  //       tokenHash: tokenHelper.hash(refreshToken),
+  //       ipAddress: req.ip || null,
+  //       userAgent: req.get("user-agent") || null,
+  //       expiresAt: new Date(refreshPayload.exp * 1000),
+  //     });
+
+  //     await db("users").where("id", user.id).update({
+  //       lastLoginAt: new Date(),
+  //       updatedAt: new Date(),
+  //     });
+
+  //     const access = await getUserAccess(user.id);
+  //     const menus = await getUserMenus(user.id);
+
+  //     if (!access) {
+  //       return res.unauthenticated(
+  //         "User access information could not be loaded.",
+  //       );
+  //     }
+
+  //     return res.success({
+  //       accessToken,
+  //       refreshToken,
+
+  //       user: access.user,
+  //       company: access.company,
+  //       division: access.division,
+
+  //       roles: access.roles,
+  //       permissions: access.permissions,
+  //       roleCodes: access.roleCodes,
+  //       permissionCodes: access.permissionCodes,
+
+  //       menus,
+  //     });
+  //   } catch (err) {
+  //     next(err);
+  //   }
+  // })
+
   .post("/login", async (req, res, next) => {
+    let email = null;
+    let user = null;
+    let loginLogWritten = false;
+
+    const ipAddress = req.ip || null;
+    const userAgent = req.get("user-agent") || null;
+
+    const writeFailedLogin = async ({
+      userId = null,
+      failureReason,
+      failureMessage,
+    }) => {
+      if (loginLogWritten) {
+        return;
+      }
+
+      loginLogWritten = true;
+
+      await createLoginLogSafely({
+        userId,
+        email,
+        statusCode: LOGIN_STATUS.FAILED,
+        failureReason,
+        failureMessage,
+        ipAddress,
+        userAgent,
+        siteId: 1,
+      });
+    };
+
     try {
-      const { email, password } = req.body;
+      const bodyEmail = req.body?.email;
+      const password = req.body?.password;
+
+      email = typeof bodyEmail === "string" ? bodyEmail.trim() : bodyEmail;
 
       if (!email || !password) {
+        await writeFailedLogin({
+          failureReason: LOGIN_FAILURE_REASON.MISSING_CREDENTIALS,
+          failureMessage: "Email and password are required.",
+        });
+
         return res.incomplete("Email and password are required.");
       }
 
-      const user = await db("users")
+      // Query lama tetap dipertahankan.
+      user = await db("users")
         .where({
           email,
           isActive: true,
@@ -30,15 +166,27 @@ route
         .first();
 
       if (!user) {
+        await writeFailedLogin({
+          failureReason: LOGIN_FAILURE_REASON.INVALID_CREDENTIALS,
+          failureMessage: "Invalid email or inactive user.",
+        });
+
         return res.unauthenticated("Invalid email or password.");
       }
 
       const isValidPassword = await bcrypt.compare(password, user.password);
 
       if (!isValidPassword) {
+        await writeFailedLogin({
+          userId: user.id,
+          failureReason: LOGIN_FAILURE_REASON.INVALID_PASSWORD,
+          failureMessage: "Password verification failed.",
+        });
+
         return res.unauthenticated("Invalid email or password.");
       }
 
+      // Seluruh proses lama di bawah ini tetap pada urutan semula.
       await db("refreshTokens")
         .where({
           userId: user.id,
@@ -66,8 +214,8 @@ route
         jti: refreshPayload.jti,
         userId: user.id,
         tokenHash: tokenHelper.hash(refreshToken),
-        ipAddress: req.ip || null,
-        userAgent: req.get("user-agent") || null,
+        ipAddress,
+        userAgent,
         expiresAt: new Date(refreshPayload.exp * 1000),
       });
 
@@ -80,10 +228,29 @@ route
       const menus = await getUserMenus(user.id);
 
       if (!access) {
+        await writeFailedLogin({
+          userId: user.id,
+          failureReason: LOGIN_FAILURE_REASON.ACCESS_LOAD_FAILED,
+          failureMessage: "User access information could not be loaded.",
+        });
+
         return res.unauthenticated(
           "User access information could not be loaded.",
         );
       }
+
+      await createLoginLogSafely({
+        userId: user.id,
+        email: user.email,
+        statusCode: LOGIN_STATUS.SUCCESS,
+        failureReason: null,
+        failureMessage: null,
+        ipAddress,
+        userAgent,
+        siteId: 1,
+      });
+
+      loginLogWritten = true;
 
       return res.success({
         accessToken,
@@ -101,6 +268,15 @@ route
         menus,
       });
     } catch (err) {
+      if (!loginLogWritten) {
+        await writeFailedLogin({
+          userId: user?.id ?? null,
+          failureReason: LOGIN_FAILURE_REASON.INTERNAL_ERROR,
+          failureMessage:
+            err instanceof Error ? err.message : "Unexpected login error.",
+        });
+      }
+
       next(err);
     }
   })
