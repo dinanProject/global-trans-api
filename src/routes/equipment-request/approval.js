@@ -689,7 +689,7 @@ async function findRequestDetails(requestId, trx = db) {
       "detail.requestId",
       "detail.equipmentCategoryId",
       "detail.equipmentUnitId",
-      "detail.quantity",
+
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
@@ -702,7 +702,6 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
-    quantity: Number(detail.quantity),
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
@@ -881,7 +880,6 @@ function normalizePayload(payload = {}) {
         detail?.equipmentCategoryId,
       ),
       equipmentUnitId: normalizePositiveInteger(detail?.equipmentUnitId),
-      quantity: normalizePositiveInteger(detail?.quantity),
       rate: normalizeNullableDecimal(detail?.rate),
       remarks: normalizeNullableString(detail?.remarks),
     })),
@@ -942,10 +940,10 @@ function validatePayload(payload) {
       };
     }
 
-    if (!detail.quantity) {
+    if (!detail.equipmentUnitId) {
       return {
         valid: false,
-        message: `Quantity pada detail baris ${rowNumber} wajib lebih dari 0.`,
+        message: `Equipment unit pada detail baris ${rowNumber} wajib diisi.`,
       };
     }
 
@@ -978,6 +976,48 @@ async function validateDetails(trx, details, requestId = null) {
       valid: false,
       message: "Terdapat equipment category yang tidak valid atau tidak aktif.",
     };
+  }
+
+  const equipmentUnitIds = details.map((detail) => detail.equipmentUnitId);
+
+  if (new Set(equipmentUnitIds).size !== equipmentUnitIds.length) {
+    return {
+      valid: false,
+      message:
+        "Equipment unit yang sama tidak boleh dipilih lebih dari satu kali dalam satu request.",
+    };
+  }
+
+  const units = await trx("equipmentUnits")
+    .whereIn("id", equipmentUnitIds)
+    .where("isActive", true)
+    .whereNull("deletedAt")
+    .select(["id", "categoryId"]);
+
+  if (units.length !== equipmentUnitIds.length) {
+    return {
+      valid: false,
+      message: "Terdapat equipment unit yang tidak valid atau tidak aktif.",
+    };
+  }
+
+  const unitById = new Map(units.map((unit) => [Number(unit.id), unit]));
+
+  for (let index = 0; index < details.length; index += 1) {
+    const detail = details[index];
+    const unit = unitById.get(Number(detail.equipmentUnitId));
+
+    if (
+      !unit ||
+      Number(unit.categoryId) !== Number(detail.equipmentCategoryId)
+    ) {
+      return {
+        valid: false,
+        message:
+          `Equipment unit pada detail baris ${index + 1} ` +
+          "tidak sesuai dengan equipment category.",
+      };
+    }
   }
 
   const suppliedDetailUuids = details
@@ -1060,7 +1100,7 @@ async function insertRequestDetails(trx, requestId, details, now) {
     requestId,
     equipmentCategoryId: detail.equipmentCategoryId,
     equipmentUnitId: detail.equipmentUnitId,
-    quantity: detail.quantity,
+    quantity: 1,
     rate: detail.rate,
     remarks: detail.remarks,
     isActive: true,
@@ -1094,7 +1134,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         .update({
           equipmentCategoryId: detail.equipmentCategoryId,
           equipmentUnitId: detail.equipmentUnitId,
-          quantity: detail.quantity,
+          quantity: 1,
           rate: detail.rate,
           remarks: detail.remarks,
           isActive: true,
@@ -1106,7 +1146,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         requestId,
         equipmentCategoryId: detail.equipmentCategoryId,
         equipmentUnitId: detail.equipmentUnitId,
-        quantity: detail.quantity,
+        quantity: 1,
         rate: detail.rate,
         remarks: detail.remarks,
         isActive: true,
@@ -1537,21 +1577,61 @@ function normalizeDate(value) {
 
   const normalizedValue = String(value).trim();
 
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedValue)) {
+  const match = normalizedValue.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?$/,
+  );
+
+  if (!match) {
     return null;
   }
 
-  const date = new Date(`${normalizedValue}T00:00:00Z`);
+  const [, year, month, day, hour, minute, second = "00"] = match;
 
-  if (Number.isNaN(date.getTime())) {
+  const values = [
+    Number(year),
+    Number(month),
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+  ];
+
+  const [
+    yearNumber,
+    monthNumber,
+    dayNumber,
+    hourNumber,
+    minuteNumber,
+    secondNumber,
+  ] = values;
+
+  if (hourNumber > 23 || minuteNumber > 59 || secondNumber > 59) {
     return null;
   }
 
-  if (date.toISOString().slice(0, 10) !== normalizedValue) {
+  const date = new Date(
+    Date.UTC(
+      yearNumber,
+      monthNumber - 1,
+      dayNumber,
+      hourNumber,
+      minuteNumber,
+      secondNumber,
+    ),
+  );
+
+  if (
+    date.getUTCFullYear() !== yearNumber ||
+    date.getUTCMonth() + 1 !== monthNumber ||
+    date.getUTCDate() !== dayNumber ||
+    date.getUTCHours() !== hourNumber ||
+    date.getUTCMinutes() !== minuteNumber ||
+    date.getUTCSeconds() !== secondNumber
+  ) {
     return null;
   }
 
-  return normalizedValue;
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
 }
 
 function parseBooleanQuery(value) {
