@@ -689,7 +689,6 @@ async function findRequestDetails(requestId, trx = db) {
       "detail.requestId",
       "detail.equipmentCategoryId",
       "detail.equipmentUnitId",
-
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
