@@ -208,9 +208,17 @@ router.get(
           findAvailableActions(equipmentRequest.status, access),
         ]);
 
+      const detailsWithAvailability =
+        await enrichRequestDetailsWithAvailability({
+          details,
+          requestId: equipmentRequest.id,
+          requestedStartDate: equipmentRequest.startDate,
+          requestedEndDate: equipmentRequest.endDate,
+        });
+
       return res.success({
         ...normalizeRequestResult(equipmentRequest),
-        details,
+        details: detailsWithAvailability,
         approvals,
         histories,
         availableActions,
@@ -683,12 +691,33 @@ async function findRequestForUpdate(trx, uuid, access) {
 
 async function findRequestDetails(requestId, trx = db) {
   const details = await trx("equipmentRequestDetails as detail")
+    .leftJoin(
+      "equipmentCategories as equipmentCategory",
+      "equipmentCategory.id",
+      "detail.equipmentCategoryId",
+    )
+    .leftJoin(
+      "equipmentUnits as equipmentUnit",
+      "equipmentUnit.id",
+      "detail.equipmentUnitId",
+    )
     .select([
       "detail.id",
       "detail.uuid",
       "detail.requestId",
       "detail.equipmentCategoryId",
+      "equipmentCategory.code as equipmentCategoryCode",
+      "equipmentCategory.name as equipmentCategoryName",
       "detail.equipmentUnitId",
+      "equipmentUnit.uuid as equipmentUnitUuid",
+      "equipmentUnit.unitCode as equipmentUnitCode",
+      "equipmentUnit.unitName as equipmentUnitName",
+      "equipmentUnit.assetNumber as equipmentUnitAssetNumber",
+      "equipmentUnit.capacityValue as equipmentUnitCapacityValue",
+      "equipmentUnit.capacityUnit as equipmentUnitCapacityUnit",
+      "detail.requiredCapacityValue",
+      "detail.requiredCapacityUnit",
+      "detail.quantity",
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
@@ -701,9 +730,232 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
+    quantity: Number(detail.quantity || 1),
+    requiredCapacityValue:
+      detail.requiredCapacityValue === null
+        ? null
+        : Number(detail.requiredCapacityValue),
+    equipmentUnitCapacityValue:
+      detail.equipmentUnitCapacityValue === null
+        ? null
+        : Number(detail.equipmentUnitCapacityValue),
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
+}
+
+async function enrichRequestDetailsWithAvailability({
+  details,
+  requestId,
+  requestedStartDate,
+  requestedEndDate,
+  trx = db,
+}) {
+  return Promise.all(
+    details.map(async (detail) => ({
+      ...detail,
+      availability: await findEquipmentUnitAvailability({
+        equipmentUnitId: detail.equipmentUnitId,
+        requestId,
+        requestedStartDate,
+        requestedEndDate,
+        trx,
+      }),
+    })),
+  );
+}
+
+async function findEquipmentUnitAvailability({
+  equipmentUnitId,
+  requestId,
+  requestedStartDate,
+  requestedEndDate,
+  trx = db,
+}) {
+  if (!equipmentUnitId) {
+    return {
+      isAvailableForRequestedPeriod: false,
+      status: "UNIT_NOT_SELECTED",
+      lastUsageStartDate: null,
+      lastUsageEndDate: null,
+      availableFrom: null,
+      conflictRequestNo: null,
+      conflictStartDate: null,
+      conflictEndDate: null,
+    };
+  }
+
+  const [lastAssignment, conflictingRequest, conflictingAssignment] =
+    await Promise.all([
+      trx("equipmentAssignments as assignment")
+        .leftJoin(
+          "equipmentRequestDetails as assignmentDetail",
+          "assignmentDetail.id",
+          "assignment.requestDetailId",
+        )
+        .where("assignment.equipmentUnitId", equipmentUnitId)
+        .whereNot("assignmentDetail.requestId", requestId)
+        .where("assignment.isActive", true)
+        .whereNull("assignment.deletedAt")
+        .whereNotIn("assignment.statusCode", ["CANCELLED"])
+        .andWhereRaw(
+          `
+          COALESCE(
+            GREATEST(
+              assignment.plannedEndDate,
+              assignment.actualEndDate
+            ),
+            assignment.plannedEndDate
+          ) <= ?
+        `,
+          [requestedStartDate],
+        )
+        .select([
+          "assignment.statusCode",
+          "assignment.plannedStartDate",
+          "assignment.plannedEndDate",
+          "assignment.actualEndDate",
+        ])
+        .orderByRaw(
+          `
+          COALESCE(
+            GREATEST(
+              assignment.plannedEndDate,
+              assignment.actualEndDate
+            ),
+            assignment.plannedEndDate
+          ) DESC
+        `,
+        )
+        .first(),
+
+      trx("equipmentRequestDetails as otherDetail")
+        .join(
+          "equipmentRequests as otherRequest",
+          "otherRequest.id",
+          "otherDetail.requestId",
+        )
+        .where("otherDetail.equipmentUnitId", equipmentUnitId)
+        .whereNot("otherRequest.id", requestId)
+        .whereIn("otherRequest.status", ["APPROVED", "ASSIGNED", "IN_PROGRESS"])
+        .where("otherRequest.isActive", true)
+        .whereNull("otherRequest.deletedAt")
+        .where("otherDetail.isActive", true)
+        .whereNull("otherDetail.deletedAt")
+        .where("otherRequest.startDate", "<=", requestedEndDate)
+        .where("otherRequest.endDate", ">=", requestedStartDate)
+        .select([
+          "otherRequest.requestNo",
+          "otherRequest.startDate",
+          "otherRequest.endDate",
+          "otherRequest.status",
+        ])
+        .orderBy("otherRequest.startDate", "asc")
+        .first(),
+
+      trx("equipmentAssignments as assignment")
+        .leftJoin(
+          "equipmentRequestDetails as assignmentDetail",
+          "assignmentDetail.id",
+          "assignment.requestDetailId",
+        )
+        .where("assignment.equipmentUnitId", equipmentUnitId)
+        .whereNot("assignmentDetail.requestId", requestId)
+        .where("assignment.isActive", true)
+        .whereNull("assignment.deletedAt")
+        .whereNotIn("assignment.statusCode", ["CANCELLED"])
+        .where("assignment.plannedStartDate", "<=", requestedEndDate)
+        .andWhere((builder) => {
+          builder.whereNull("assignment.actualEndDate").orWhereRaw(
+            `
+              GREATEST(
+                assignment.plannedEndDate,
+                assignment.actualEndDate
+              ) >= ?
+            `,
+            [requestedStartDate],
+          );
+        })
+        .select([
+          "assignment.statusCode",
+          "assignment.plannedStartDate",
+          "assignment.plannedEndDate",
+          "assignment.actualEndDate",
+        ])
+        .orderBy("assignment.plannedStartDate", "asc")
+        .first(),
+    ]);
+
+  const lastUsageEndDate = getAssignmentEffectiveEndDate(lastAssignment);
+
+  if (conflictingRequest) {
+    return {
+      isAvailableForRequestedPeriod: false,
+      status: "RESERVED",
+      lastUsageStartDate: lastAssignment?.plannedStartDate || null,
+      lastUsageEndDate,
+      availableFrom: conflictingRequest.endDate,
+      conflictRequestNo: conflictingRequest.requestNo,
+      conflictStartDate: conflictingRequest.startDate,
+      conflictEndDate: conflictingRequest.endDate,
+    };
+  }
+
+  if (conflictingAssignment) {
+    const conflictingAssignmentEndDate = getAssignmentEffectiveEndDate(
+      conflictingAssignment,
+    );
+
+    return {
+      isAvailableForRequestedPeriod: false,
+      status: conflictingAssignment.actualEndDate
+        ? "ASSIGNMENT_CONFLICT"
+        : "ACTIVE_ASSIGNMENT",
+      lastUsageStartDate: lastAssignment?.plannedStartDate || null,
+      lastUsageEndDate,
+      availableFrom: conflictingAssignment.actualEndDate
+        ? conflictingAssignmentEndDate
+        : null,
+      conflictRequestNo: null,
+      conflictStartDate: conflictingAssignment.plannedStartDate,
+      conflictEndDate: conflictingAssignmentEndDate,
+    };
+  }
+
+  return {
+    isAvailableForRequestedPeriod: true,
+    status: "AVAILABLE",
+    lastUsageStartDate: lastAssignment?.plannedStartDate || null,
+    lastUsageEndDate,
+    availableFrom: lastUsageEndDate,
+    conflictRequestNo: null,
+    conflictStartDate: null,
+    conflictEndDate: null,
+  };
+}
+
+function getAssignmentEffectiveEndDate(assignment) {
+  if (!assignment) {
+    return null;
+  }
+
+  if (!assignment.actualEndDate) {
+    return assignment.plannedEndDate || null;
+  }
+
+  const plannedEndDate = new Date(assignment.plannedEndDate);
+  const actualEndDate = new Date(assignment.actualEndDate);
+
+  if (
+    Number.isNaN(plannedEndDate.getTime()) ||
+    Number.isNaN(actualEndDate.getTime())
+  ) {
+    return assignment.actualEndDate || assignment.plannedEndDate || null;
+  }
+
+  return actualEndDate > plannedEndDate
+    ? assignment.actualEndDate
+    : assignment.plannedEndDate;
 }
 
 async function findRequestApprovals(requestId, trx = db) {
