@@ -151,6 +151,53 @@ router.get("/", authorization("EQUIPMENT_APPROVAL.VIEW"), async (req, res) => {
       { column: "request.id", order: "desc" },
     ]);
 
+    const requestIds = requests.map((request) => request.id);
+
+    const equipmentRows =
+      requestIds.length > 0
+        ? await db("equipmentRequestDetails as detail")
+            .leftJoin(
+              "equipmentUnits as equipmentUnit",
+              "equipmentUnit.id",
+              "detail.equipmentUnitId",
+            )
+            .leftJoin(
+              "equipmentCategories as equipmentCategory",
+              "equipmentCategory.id",
+              "detail.equipmentCategoryId",
+            )
+            .whereIn("detail.requestId", requestIds)
+            .where("detail.isActive", true)
+            .whereNull("detail.deletedAt")
+            .select([
+              "detail.requestId",
+              "detail.equipmentUnitId",
+              "equipmentUnit.uuid as equipmentUnitUuid",
+              "equipmentUnit.unitCode as equipmentUnitCode",
+              "equipmentUnit.unitName as equipmentUnitName",
+              "equipmentCategory.code as equipmentCategoryCode",
+              "equipmentCategory.name as equipmentCategoryName",
+            ])
+            .orderBy("detail.id", "asc")
+        : [];
+
+    const equipmentByRequestId = new Map();
+
+    for (const row of equipmentRows) {
+      const items = equipmentByRequestId.get(row.requestId) || [];
+
+      items.push({
+        equipmentUnitId: row.equipmentUnitId,
+        equipmentUnitUuid: row.equipmentUnitUuid,
+        equipmentUnitCode: row.equipmentUnitCode,
+        equipmentUnitName: row.equipmentUnitName,
+        equipmentCategoryCode: row.equipmentCategoryCode,
+        equipmentCategoryName: row.equipmentCategoryName,
+      });
+
+      equipmentByRequestId.set(row.requestId, items);
+    }
+
     const approvalPermissions = new Set([
       "EQUIPMENT_APPROVAL.CLIENT_APPROVE",
       "EQUIPMENT_APPROVAL.CLIENT_REJECT",
@@ -173,6 +220,7 @@ router.get("/", authorization("EQUIPMENT_APPROVAL.VIEW"), async (req, res) => {
       if (approvalActions.length > 0) {
         result.push({
           ...normalizeRequestResult(request),
+          details: equipmentByRequestId.get(request.id) || [],
           availableActions: approvalActions,
         });
       }
@@ -319,7 +367,7 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
 
     let reviewedSchedule = null;
 
-    if (actionCode === "APPROVE_GTSI") {
+    if ([ACTION_APPROVE_CLIENT, ACTION_APPROVE_GTSI].includes(actionCode)) {
       reviewedSchedule = normalizeReviewSchedulePayload(req.body);
 
       if (!reviewedSchedule.valid) {
@@ -560,21 +608,27 @@ async function validateFinalRequestAvailability(
       .andWhere((builder) => {
         builder.whereNull("assignment.actualEndDate").orWhereRaw(
           `
-              GREATEST(
-                assignment.plannedEndDate,
-                assignment.actualEndDate
-              ) >= ?
-            `,
+          COALESCE(
+            GREATEST(
+              assignment.plannedEndDate,
+              assignment.actualEndDate
+            ),
+            assignment.plannedEndDate
+          ) >= ?
+        `,
           [startDate],
         );
       })
       .first([
         "assignment.statusCode",
+        "assignment.plannedStartDate",
         "assignment.plannedEndDate",
         "assignment.actualEndDate",
       ]);
 
     if (activeAssignment) {
+      const availableAt = getAssignmentEffectiveEndDate(activeAssignment);
+
       if (!activeAssignment.actualEndDate) {
         return {
           valid: false,
@@ -583,14 +637,6 @@ async function validateFinalRequestAvailability(
             "assignment yang belum diselesaikan.",
         };
       }
-
-      const plannedEndDate = new Date(activeAssignment.plannedEndDate);
-      const actualEndDate = new Date(activeAssignment.actualEndDate);
-
-      const availableAt =
-        actualEndDate > plannedEndDate
-          ? activeAssignment.actualEndDate
-          : activeAssignment.plannedEndDate;
 
       return {
         valid: false,
@@ -751,17 +797,26 @@ async function enrichRequestDetailsWithAvailability({
   requestedEndDate,
   trx = db,
 }) {
+  const statusMap = await getAvailabilityStatusMap(trx);
+
   return Promise.all(
-    details.map(async (detail) => ({
-      ...detail,
-      availability: await findEquipmentUnitAvailability({
+    details.map(async (detail) => {
+      const availability = await findEquipmentUnitAvailability({
         equipmentUnitId: detail.equipmentUnitId,
         requestId,
         requestedStartDate,
         requestedEndDate,
         trx,
-      }),
-    })),
+      });
+
+      return {
+        ...detail,
+        availability: {
+          ...availability,
+          statusName: statusMap.get(availability.status) || availability.status,
+        },
+      };
+    }),
   );
 }
 
@@ -780,6 +835,11 @@ async function findEquipmentUnitAvailability({
       lastUsageEndDate: null,
       availableFrom: null,
       conflictRequestNo: null,
+      conflictCompanyUuid: null,
+      conflictCompanyCode: null,
+      conflictCompanyName: null,
+      conflictRequesterUuid: null,
+      conflictRequesterName: null,
       conflictStartDate: null,
       conflictEndDate: null,
     };
@@ -835,6 +895,16 @@ async function findEquipmentUnitAvailability({
           "otherRequest.id",
           "otherDetail.requestId",
         )
+        .leftJoin("companies as otherCompany", function () {
+          this.on("otherCompany.id", "=", "otherRequest.companyId").andOnNull(
+            "otherCompany.deletedAt",
+          );
+        })
+        .leftJoin("users as otherRequester", function () {
+          this.on("otherRequester.id", "=", "otherRequest.requestBy").andOnNull(
+            "otherRequester.deletedAt",
+          );
+        })
         .where("otherDetail.equipmentUnitId", equipmentUnitId)
         .whereNot("otherRequest.id", requestId)
         .whereIn("otherRequest.status", ["APPROVED", "ASSIGNED", "IN_PROGRESS"])
@@ -849,6 +919,11 @@ async function findEquipmentUnitAvailability({
           "otherRequest.startDate",
           "otherRequest.endDate",
           "otherRequest.status",
+          "otherCompany.uuid as companyUuid",
+          "otherCompany.code as companyCode",
+          "otherCompany.name as companyName",
+          "otherRequester.uuid as requesterUuid",
+          "otherRequester.fullName as requesterName",
         ])
         .orderBy("otherRequest.startDate", "asc")
         .first(),
@@ -896,6 +971,11 @@ async function findEquipmentUnitAvailability({
       lastUsageEndDate,
       availableFrom: conflictingRequest.endDate,
       conflictRequestNo: conflictingRequest.requestNo,
+      conflictCompanyUuid: conflictingRequest.companyUuid || null,
+      conflictCompanyCode: conflictingRequest.companyCode || null,
+      conflictCompanyName: conflictingRequest.companyName || null,
+      conflictRequesterUuid: conflictingRequest.requesterUuid || null,
+      conflictRequesterName: conflictingRequest.requesterName || null,
       conflictStartDate: conflictingRequest.startDate,
       conflictEndDate: conflictingRequest.endDate,
     };
@@ -917,6 +997,11 @@ async function findEquipmentUnitAvailability({
         ? conflictingAssignmentEndDate
         : null,
       conflictRequestNo: null,
+      conflictCompanyUuid: null,
+      conflictCompanyCode: null,
+      conflictCompanyName: null,
+      conflictRequesterUuid: null,
+      conflictRequesterName: null,
       conflictStartDate: conflictingAssignment.plannedStartDate,
       conflictEndDate: conflictingAssignmentEndDate,
     };
@@ -929,6 +1014,11 @@ async function findEquipmentUnitAvailability({
     lastUsageEndDate,
     availableFrom: lastUsageEndDate,
     conflictRequestNo: null,
+    conflictCompanyUuid: null,
+    conflictCompanyCode: null,
+    conflictCompanyName: null,
+    conflictRequesterUuid: null,
+    conflictRequesterName: null,
     conflictStartDate: null,
     conflictEndDate: null,
   };
@@ -1074,6 +1164,15 @@ async function findAvailableActions(statusCode, access, trx = db) {
       lockRequest: Boolean(transition.lockRequest),
       sortOrder: Number(transition.sortOrder),
     }));
+}
+
+async function getAvailabilityStatusMap(trx = db) {
+  const rows = await trx("sysLookups")
+    .where("lookupGroup", "equipment_availability_status")
+    .where("isActive", true)
+    .select(["lookupCode", "lookupValue"]);
+
+  return new Map(rows.map((row) => [row.lookupCode, row.lookupValue]));
 }
 
 function normalizeReviewSchedulePayload(payload = {}) {
@@ -1897,6 +1996,53 @@ function parseBooleanQuery(value) {
   }
 
   throw new Error("Query isActive harus berupa true atau false.");
+}
+
+async function lockRequestEquipmentUnits(trx, requestId) {
+  const details = await trx("equipmentRequestDetails")
+    .where("requestId", requestId)
+    .where("isActive", true)
+    .whereNull("deletedAt")
+    .select(["id", "equipmentUnitId"])
+    .forUpdate();
+
+  if (details.length === 0) {
+    return {
+      valid: false,
+      message: "Equipment request tidak memiliki detail aktif.",
+    };
+  }
+
+  if (details.some((detail) => !detail.equipmentUnitId)) {
+    return {
+      valid: false,
+      message: "Seluruh request detail wajib memiliki equipment unit.",
+    };
+  }
+
+  const equipmentUnitIds = [
+    ...new Set(details.map((detail) => Number(detail.equipmentUnitId))),
+  ];
+
+  const lockedUnits = await trx("equipmentUnits")
+    .whereIn("id", equipmentUnitIds)
+    .where("isActive", true)
+    .whereNull("deletedAt")
+    .select(["id", "unitCode"])
+    .forUpdate();
+
+  if (lockedUnits.length !== equipmentUnitIds.length) {
+    return {
+      valid: false,
+      message: "Terdapat equipment unit yang tidak ditemukan atau tidak aktif.",
+    };
+  }
+
+  return {
+    valid: true,
+    details,
+    units: lockedUnits,
+  };
 }
 
 module.exports = router;
