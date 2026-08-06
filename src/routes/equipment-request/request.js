@@ -1366,7 +1366,7 @@ async function validateEquipmentUnitAvailability(
     .where("assignment.isActive", true)
     .whereNull("assignment.deletedAt")
     .whereNull("requestDetail.deletedAt")
-    .whereNotIn("assignment.statusCode", "CANCELLED")
+    .whereNotIn("assignment.statusCode", ["CANCELLED"])
     .where("assignment.plannedStartDate", "<=", endDate)
     .andWhere((builder) => {
       builder.whereNull("assignment.actualEndDate").orWhereRaw(

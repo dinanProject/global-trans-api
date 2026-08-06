@@ -1600,7 +1600,7 @@ async function validateEquipmentSchedule(trx, payload) {
     .where("equipmentUnitId", payload.equipmentUnitId)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .whereNotIn("statusCode", ASSIGNMENT_STATUS_CANCELLED)
+    .whereNotIn("statusCode", [ASSIGNMENT_STATUS_CANCELLED])
     .where("plannedStartDate", "<=", payload.plannedEndDate)
     .andWhere((builder) => {
       builder.whereNull("actualEndDate").orWhereRaw(
@@ -1682,7 +1682,7 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
       .where("requestDetailId", detail.id)
       .where("isActive", true)
       .whereNull("deletedAt")
-      .whereNotIn("statusCode", ASSIGNMENT_STATUS_CANCELLED)
+      .whereNotIn("statusCode", [ASSIGNMENT_STATUS_CANCELLED])
       .first("id");
 
     if (!assignment) {
