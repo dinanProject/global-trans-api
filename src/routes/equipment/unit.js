@@ -6,61 +6,76 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 const db = require("../../lib/db")();
 
 router.use(authentication);
 
 router
-  .get("/", async (req, res) => {
-    try {
-      const { search, categoryUuid, isActive } = req.query;
+  .get(
+    "/",
+    authorization(
+      [
+        "EQUIPMENT_UNIT.VIEW",
+        "EQUIPMENT_REQUEST.VIEW",
+        "EQUIPMENT_REQUEST.CREATE",
+        "EQUIPMENT_REQUEST.UPDATE",
+      ],
+      {
+        requireAll: false,
+      },
+    ),
+    async (req, res) => {
+      try {
+        const { search, categoryUuid, isActive } = req.query;
 
-      const query = createEquipmentUnitQuery();
+        const query = createEquipmentUnitQuery();
 
-      if (search) {
-        const normalizedSearch = `%${String(search).trim()}%`;
+        if (search) {
+          const normalizedSearch = `%${String(search).trim()}%`;
 
-        query.andWhere((builder) => {
-          builder
-            .where("unit.unitCode", "like", normalizedSearch)
-            .orWhere("unit.unitName", "like", normalizedSearch)
-            .orWhere("unit.assetNumber", "like", normalizedSearch)
-            .orWhere("unit.modelNumber", "like", normalizedSearch)
-            .orWhere("unit.plateNumber", "like", normalizedSearch)
-            .orWhere("unit.remarks", "like", normalizedSearch)
-            .orWhere("category.code", "like", normalizedSearch)
-            .orWhere("category.name", "like", normalizedSearch);
-        });
+          query.andWhere((builder) => {
+            builder
+              .where("unit.unitCode", "like", normalizedSearch)
+              .orWhere("unit.unitName", "like", normalizedSearch)
+              .orWhere("unit.assetNumber", "like", normalizedSearch)
+              .orWhere("unit.modelNumber", "like", normalizedSearch)
+              .orWhere("unit.plateNumber", "like", normalizedSearch)
+              .orWhere("unit.remarks", "like", normalizedSearch)
+              .orWhere("category.code", "like", normalizedSearch)
+              .orWhere("category.name", "like", normalizedSearch);
+          });
+        }
+
+        if (categoryUuid) {
+          query.andWhere("category.uuid", String(categoryUuid).trim());
+        }
+
+        if (isActive !== undefined) {
+          query.andWhere("unit.isActive", parseBooleanQuery(isActive));
+        }
+
+        const units = await query.orderBy([
+          {
+            column: "unit.unitName",
+            order: "asc",
+          },
+          {
+            column: "unit.unitCode",
+            order: "asc",
+          },
+        ]);
+
+        return res.success(units);
+      } catch (error) {
+        console.error("GET /equipment-unit error:", error);
+
+        return res.fail(error.message || "Failed to load equipment units.");
       }
+    },
+  )
 
-      if (categoryUuid) {
-        query.andWhere("category.uuid", String(categoryUuid).trim());
-      }
-
-      if (isActive !== undefined) {
-        query.andWhere("unit.isActive", parseBooleanQuery(isActive));
-      }
-
-      const units = await query.orderBy([
-        {
-          column: "unit.unitName",
-          order: "asc",
-        },
-        {
-          column: "unit.unitCode",
-          order: "asc",
-        },
-      ]);
-
-      return res.success(units);
-    } catch (error) {
-      console.error("GET /equipment-unit error:", error);
-
-      return res.fail(error.message || "Failed to load equipment units.");
-    }
-  })
-
-  .get("/:uuid", async (req, res) => {
+  .get("/:uuid", authorization("EQUIPMENT_UNIT.VIEW"), async (req, res) => {
     try {
       const unit = await findEquipmentUnitByUuid(req.params.uuid);
 
@@ -76,7 +91,7 @@ router
     }
   })
 
-  .post("/", async (req, res) => {
+  .post("/", authorization("EQUIPMENT_UNIT.CREATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -205,7 +220,7 @@ router
   /**
    * PUT /equipment-unit/:uuid
    */
-  .put("/:uuid", async (req, res) => {
+  .put("/:uuid", authorization("EQUIPMENT_UNIT.UPDATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -344,45 +359,49 @@ router
    *
    * Soft delete.
    */
-  .delete("/:uuid", async (req, res) => {
-    const trx = await db.transaction();
+  .delete(
+    "/:uuid",
+    authorization("EQUIPMENT_UNIT.DELETE"),
+    async (req, res) => {
+      const trx = await db.transaction();
 
-    try {
-      const unit = await trx("equipmentUnits")
-        .where("uuid", req.params.uuid)
-        .whereNull("deletedAt")
-        .first();
+      try {
+        const unit = await trx("equipmentUnits")
+          .where("uuid", req.params.uuid)
+          .whereNull("deletedAt")
+          .first();
 
-      if (!unit) {
-        await trx.rollback();
+        if (!unit) {
+          await trx.rollback();
 
-        return res.incomplete("Equipment unit tidak ditemukan.");
+          return res.incomplete("Equipment unit tidak ditemukan.");
+        }
+
+        /*
+         * Ketika transaksi rental sudah dibuat, validasi pemakaian unit
+         * dapat ditambahkan di sini sebelum unit dihapus.
+         */
+
+        await trx("equipmentUnits").where("id", unit.id).update({
+          isActive: false,
+          deletedAt: db.fn.now(),
+          updatedAt: db.fn.now(),
+        });
+
+        await trx.commit();
+
+        return res.success({
+          uuid: unit.uuid,
+        });
+      } catch (error) {
+        await rollbackTransaction(trx);
+
+        console.error("DELETE /equipment-unit/:uuid error:", error);
+
+        return res.fail(error.message || "Failed to delete equipment unit.");
       }
-
-      /*
-       * Ketika transaksi rental sudah dibuat, validasi pemakaian unit
-       * dapat ditambahkan di sini sebelum unit dihapus.
-       */
-
-      await trx("equipmentUnits").where("id", unit.id).update({
-        isActive: false,
-        deletedAt: db.fn.now(),
-        updatedAt: db.fn.now(),
-      });
-
-      await trx.commit();
-
-      return res.success({
-        uuid: unit.uuid,
-      });
-    } catch (error) {
-      await rollbackTransaction(trx);
-
-      console.error("DELETE /equipment-unit/:uuid error:", error);
-
-      return res.fail(error.message || "Failed to delete equipment unit.");
-    }
-  });
+    },
+  );
 
 function createEquipmentUnitQuery(database = db) {
   return database("equipmentUnits as unit")
