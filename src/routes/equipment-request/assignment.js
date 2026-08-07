@@ -114,17 +114,42 @@ async function findRequestForUpdate(trx, uuid, access) {
 
 async function findRequestDetails(requestId, trx = db) {
   const details = await trx("equipmentRequestDetails as detail")
+    .leftJoin("equipmentCategories as category", function () {
+      this.on("category.id", "=", "detail.equipmentCategoryId").andOnNull(
+        "category.deletedAt",
+      );
+    })
+    .leftJoin("equipmentUnits as equipmentUnit", function () {
+      this.on("equipmentUnit.id", "=", "detail.equipmentUnitId").andOnNull(
+        "equipmentUnit.deletedAt",
+      );
+    })
     .select([
       "detail.id",
       "detail.uuid",
       "detail.requestId",
+
       "detail.equipmentCategoryId",
+      "category.uuid as equipmentCategoryUuid",
+      "category.code as equipmentCategoryCode",
+      "category.name as equipmentCategoryName",
+      "category.icon as equipmentCategoryIcon",
+
       "detail.equipmentUnitId",
+      "equipmentUnit.uuid as equipmentUnitUuid",
+      "equipmentUnit.unitCode as equipmentUnitCode",
+      "equipmentUnit.unitName as equipmentUnitName",
+      "equipmentUnit.assetNumber as equipmentUnitAssetNumber",
+      "equipmentUnit.modelNumber as equipmentUnitModelNumber",
+      "equipmentUnit.plateNumber as equipmentUnitPlateNumber",
+      "equipmentUnit.capacityValue as equipmentUnitCapacityValue",
+      "equipmentUnit.capacityUnit as equipmentUnitCapacityUnit",
+
+      "detail.requiredCapacityValue",
+      "detail.requiredCapacityUnit",
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
-      "detail.createdAt",
-      "detail.updatedAt",
     ])
     .where("detail.requestId", requestId)
     .whereNull("detail.deletedAt")
@@ -132,6 +157,14 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
+    requiredCapacityValue:
+      detail.requiredCapacityValue === null
+        ? null
+        : Number(detail.requiredCapacityValue),
+    equipmentUnitCapacityValue:
+      detail.equipmentUnitCapacityValue === null
+        ? null
+        : Number(detail.equipmentUnitCapacityValue),
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
@@ -1016,6 +1049,42 @@ function parseBooleanQuery(value) {
   throw new Error("Query isActive harus berupa true atau false.");
 }
 
+router.get(
+  "/:uuid/workspace",
+  authorization("EQUIPMENT_REQUEST.VIEW"),
+  async (req, res) => {
+    try {
+      const access = await getRequestAccess(req);
+
+      const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
+
+      if (!equipmentRequest) {
+        return res.incomplete("Equipment request tidak ditemukan.");
+      }
+
+      const [details, assignments] = await Promise.all([
+        findRequestDetails(equipmentRequest.id),
+        findAssignments(equipmentRequest.id),
+      ]);
+
+      return res.success({
+        request: {
+          ...equipmentRequest,
+          details,
+        },
+        assignments,
+      });
+    } catch (error) {
+      console.error(
+        "GET /equipment-request/assignment/:uuid/workspace error:",
+        error,
+      );
+
+      return res.fail(error.message || "Failed to load assignment workspace.");
+    }
+  },
+);
+
 /**
  * GET /equipment-request/:uuid
  */
@@ -1258,6 +1327,393 @@ router.post(
       return res.fail(
         error.message || "Failed to create equipment assignment.",
       );
+    }
+  },
+);
+
+router.post(
+  "/:uuid/bulk",
+  authorization("EQUIPMENT_REQUEST.ASSIGN"),
+  async (req, res) => {
+    const trx = await db.transaction();
+
+    try {
+      const access = await getRequestAccess(req);
+
+      const equipmentRequest = await findRequestForUpdate(
+        trx,
+        req.params.uuid,
+        access,
+      );
+
+      if (!equipmentRequest) {
+        await trx.rollback();
+
+        return res.incomplete("Equipment request tidak ditemukan.");
+      }
+
+      if (!equipmentRequest.approvalLocked) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Equipment hanya dapat di-assign setelah request mendapat approval final.",
+        );
+      }
+
+      if (equipmentRequest.status !== STATUS_APPROVED) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Assignment hanya dapat dilakukan pada request berstatus ${STATUS_APPROVED}. Status saat ini: ${equipmentRequest.status}.`,
+        );
+      }
+
+      const rawAssignments = Array.isArray(req.body?.assignments)
+        ? req.body.assignments
+        : [];
+
+      if (rawAssignments.length === 0) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Minimal satu equipment assignment wajib dikirim.",
+        );
+      }
+
+      const payloads = rawAssignments.map((item) =>
+        normalizeAssignmentPayload(item),
+      );
+
+      for (let index = 0; index < payloads.length; index += 1) {
+        const validation = validateAssignmentPayload(payloads[index]);
+
+        if (!validation.valid) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Assignment baris ${index + 1}: ${validation.message}`,
+          );
+        }
+      }
+
+      const requestDetailUuids = payloads.map(
+        (payload) => payload.requestDetailUuid,
+      );
+
+      if (new Set(requestDetailUuids).size !== requestDetailUuids.length) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Request detail tidak boleh memiliki assignment duplikat.",
+        );
+      }
+
+      const equipmentUnitUuids = payloads.map(
+        (payload) => payload.equipmentUnitUuid,
+      );
+
+      if (new Set(equipmentUnitUuids).size !== equipmentUnitUuids.length) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Equipment unit tidak boleh digunakan lebih dari satu kali dalam proses Assign All.",
+        );
+      }
+
+      const requestDetails = await trx("equipmentRequestDetails")
+        .where("requestId", equipmentRequest.id)
+        .whereIn("uuid", requestDetailUuids)
+        .where("isActive", true)
+        .whereNull("deletedAt");
+
+      if (requestDetails.length !== requestDetailUuids.length) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Terdapat equipment request detail yang tidak valid.",
+        );
+      }
+
+      const equipmentUnits = await trx("equipmentUnits")
+        .whereIn("uuid", equipmentUnitUuids)
+        .where("isActive", true)
+        .whereNull("deletedAt")
+        .select([
+          "id",
+          "uuid",
+          "categoryId",
+          "unitName",
+          "unitCode",
+          "assetNumber",
+          "modelNumber",
+          "plateNumber",
+          "capacityValue",
+          "capacityUnit",
+        ]);
+
+      if (equipmentUnits.length !== equipmentUnitUuids.length) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Terdapat equipment unit yang tidak valid atau tidak aktif.",
+        );
+      }
+
+      const detailByUuid = new Map(
+        requestDetails.map((detail) => [detail.uuid, detail]),
+      );
+
+      const unitByUuid = new Map(
+        equipmentUnits.map((unit) => [unit.uuid, unit]),
+      );
+
+      const now = db.fn.now();
+      const assignmentRows = [];
+      const historyRows = [];
+
+      for (const payload of payloads) {
+        const requestDetail = detailByUuid.get(payload.requestDetailUuid);
+
+        const equipmentUnit = unitByUuid.get(payload.equipmentUnitUuid);
+
+        if (
+          Number(requestDetail.equipmentUnitId) !== Number(equipmentUnit.id)
+        ) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Equipment unit ${equipmentUnit.unitCode} tidak sesuai dengan unit yang telah disetujui pada request detail ${requestDetail.uuid}.`,
+          );
+        }
+
+        if (
+          Number(requestDetail.equipmentCategoryId) !==
+          Number(equipmentUnit.categoryId)
+        ) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Equipment unit ${equipmentUnit.unitCode} tidak sesuai dengan category request detail.`,
+          );
+        }
+
+        if (
+          String(equipmentUnit.capacityUnit || "").toUpperCase() !==
+          String(requestDetail.requiredCapacityUnit || "").toUpperCase()
+        ) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Satuan kapasitas unit ${equipmentUnit.unitCode} tidak sesuai dengan kebutuhan request.`,
+          );
+        }
+
+        if (
+          Number(equipmentUnit.capacityValue) <
+          Number(requestDetail.requiredCapacityValue)
+        ) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Kapasitas unit ${equipmentUnit.unitCode} tidak mencukupi.`,
+          );
+        }
+
+        const scheduleValidation = await validateEquipmentSchedule(trx, {
+          equipmentUnitId: equipmentUnit.id,
+          plannedStartDate: payload.plannedStartDate,
+          plannedEndDate: payload.plannedEndDate,
+        });
+
+        if (!scheduleValidation.valid) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `${equipmentUnit.unitCode}: ${scheduleValidation.message}`,
+          );
+        }
+
+        assignmentRows.push({
+          uuid: randomUUID(),
+          requestId: equipmentRequest.id,
+          requestDetailId: requestDetail.id,
+          equipmentUnitId: equipmentUnit.id,
+          statusCode: ASSIGNMENT_STATUS_ASSIGNED,
+          plannedStartDate: payload.plannedStartDate,
+          plannedEndDate: payload.plannedEndDate,
+          actualStartDate: null,
+          actualEndDate: null,
+          assignedBy: access.user.id,
+          assignedAt: now,
+          releasedBy: null,
+          releasedAt: null,
+          notes: payload.notes,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+          deletedAt: null,
+        });
+
+        historyRows.push({
+          uuid: randomUUID(),
+          requestId: equipmentRequest.id,
+          activity: "ASSIGN_EQUIPMENT",
+          description:
+            `Equipment unit ${equipmentUnit.uuid} di-assign ` +
+            `ke request detail ${requestDetail.uuid}.`,
+          userId: access.user.id,
+          createdAt: now,
+        });
+      }
+
+      await trx("equipmentAssignments").insert(assignmentRows);
+
+      await trx("equipmentRequestHistories").insert(historyRows);
+
+      const assignmentStatusResult = await synchronizeRequestAssignmentStatus(
+        trx,
+        equipmentRequest.id,
+      );
+
+      if (assignmentStatusResult.statusChanged) {
+        await enqueueAssignmentNotifications(trx, {
+          requestId: equipmentRequest.id,
+          actionUserId: access.user.id,
+          previousStatusCode: assignmentStatusResult.previousStatusCode,
+        });
+      }
+
+      await trx.commit();
+
+      const assignments = await findAssignments(equipmentRequest.id);
+
+      return res.success(assignments);
+    } catch (error) {
+      await trx.rollback();
+
+      console.error(
+        "POST /equipment-request/assignment/:uuid/bulk error:",
+        error,
+      );
+
+      return res.fail(
+        error.message || "Failed to create equipment assignments.",
+      );
+    }
+  },
+);
+
+router.post(
+  "/:uuid/start-all",
+  authorization("EQUIPMENT_REQUEST.START_OPERATION"),
+  async (req, res) => {
+    const trx = await db.transaction();
+
+    try {
+      const access = await getRequestAccess(req);
+
+      const equipmentRequest = await findRequestForUpdate(
+        trx,
+        req.params.uuid,
+        access,
+      );
+
+      if (!equipmentRequest) {
+        await trx.rollback();
+
+        return res.incomplete("Equipment request tidak ditemukan.");
+      }
+
+      const assignmentUuids = Array.isArray(req.body?.assignmentUuids)
+        ? [...new Set(req.body.assignmentUuids.filter(Boolean))]
+        : [];
+
+      if (assignmentUuids.length === 0) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Minimal satu equipment assignment wajib dipilih.",
+        );
+      }
+
+      const assignments = await trx("equipmentAssignments")
+        .where("requestId", equipmentRequest.id)
+        .whereIn("uuid", assignmentUuids)
+        .where("isActive", true)
+        .whereNull("deletedAt")
+        .forUpdate()
+        .select(["id", "uuid", "statusCode"]);
+
+      if (assignments.length !== assignmentUuids.length) {
+        await trx.rollback();
+
+        return res.incomplete(
+          "Terdapat equipment assignment yang tidak ditemukan.",
+        );
+      }
+
+      const invalidAssignment = assignments.find(
+        (assignment) => assignment.statusCode !== ASSIGNMENT_STATUS_ASSIGNED,
+      );
+
+      if (invalidAssignment) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Assignment ${invalidAssignment.uuid} berstatus ${invalidAssignment.statusCode} dan tidak dapat dimulai.`,
+        );
+      }
+
+      const now = db.fn.now();
+      const assignmentIds = assignments.map((assignment) => assignment.id);
+
+      await trx("equipmentAssignments").whereIn("id", assignmentIds).update({
+        statusCode: ASSIGNMENT_STATUS_IN_OPERATION,
+        actualStartDate: now,
+        updatedAt: now,
+      });
+
+      await trx("equipmentRequestHistories").insert(
+        assignments.map((assignment) => ({
+          uuid: randomUUID(),
+          requestId: equipmentRequest.id,
+          activity: "START_OPERATION",
+          description: `Assignment ${assignment.uuid} mulai beroperasi.`,
+          userId: access.user.id,
+          createdAt: now,
+        })),
+      );
+
+      const operationalStatusResult = await synchronizeRequestOperationalStatus(
+        trx,
+        equipmentRequest.id,
+      );
+
+      if (
+        operationalStatusResult.statusChanged &&
+        operationalStatusResult.statusCode === STATUS_IN_PROGRESS
+      ) {
+        await enqueueOperationStartedNotifications(trx, {
+          requestId: equipmentRequest.id,
+          actionUserId: access.user.id,
+          previousStatusCode: operationalStatusResult.previousStatusCode,
+        });
+      }
+
+      await trx.commit();
+
+      const updatedAssignments = await findAssignments(equipmentRequest.id);
+
+      return res.success(updatedAssignments);
+    } catch (error) {
+      await trx.rollback();
+
+      console.error(
+        "POST /equipment-request/assignment/:uuid/start-all error:",
+        error,
+      );
+
+      return res.fail(error.message || "Failed to start equipment operations.");
     }
   },
 );
@@ -1663,35 +2119,33 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
     };
   }
 
-  const details = await trx("equipmentRequestDetails")
-    .where("requestId", requestId)
-    .where("isActive", true)
-    .whereNull("deletedAt")
-    .select(["id"]);
+  const detailSummary = await trx("equipmentRequestDetails as detail")
+    .leftJoin("equipmentAssignments as assignment", function () {
+      this.on("assignment.requestDetailId", "=", "detail.id")
+        .andOnVal("assignment.isActive", "=", 1)
+        .andOnNull("assignment.deletedAt")
+        .andOnNotIn("assignment.statusCode", [ASSIGNMENT_STATUS_CANCELLED]);
+    })
+    .where("detail.requestId", requestId)
+    .where("detail.isActive", true)
+    .whereNull("detail.deletedAt")
+    .countDistinct({
+      detailCount: "detail.id",
+    })
+    .countDistinct({
+      assignedDetailCount: "assignment.requestDetailId",
+    })
+    .first();
 
-  if (details.length === 0) {
+  const detailCount = Number(detailSummary?.detailCount) || 0;
+  const assignedDetailCount = Number(detailSummary?.assignedDetailCount) || 0;
+
+  if (detailCount === 0 || assignedDetailCount < detailCount) {
     return {
       statusChanged: false,
       previousStatusCode: request.status,
       statusCode: request.status,
     };
-  }
-
-  for (const detail of details) {
-    const assignment = await trx("equipmentAssignments")
-      .where("requestDetailId", detail.id)
-      .where("isActive", true)
-      .whereNull("deletedAt")
-      .whereNotIn("statusCode", [ASSIGNMENT_STATUS_CANCELLED])
-      .first("id");
-
-    if (!assignment) {
-      return {
-        statusChanged: false,
-        previousStatusCode: request.status,
-        statusCode: request.status,
-      };
-    }
   }
 
   if (request.status === STATUS_ASSIGNED) {

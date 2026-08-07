@@ -399,14 +399,26 @@ router
   });
 
 function createRoleDetailQuery() {
+  const permissionCountQuery = db("rolePermissions")
+    .select("roleId")
+    .countDistinct({
+      permissionCount: "permissionId",
+    })
+    .groupBy("roleId")
+    .as("permissionCount");
+
+  const userCountQuery = db("userRoles")
+    .select("roleId")
+    .countDistinct({
+      userCount: "userId",
+    })
+    .groupBy("roleId")
+    .as("userCount");
+
   return db("roles as role")
     .leftJoin("companies as company", "company.id", "role.companyId")
-    .leftJoin(
-      "rolePermissions as rolePermission",
-      "rolePermission.roleId",
-      "role.id",
-    )
-    .leftJoin("userRoles as userRole", "userRole.roleId", "role.id")
+    .leftJoin(permissionCountQuery, "permissionCount.roleId", "role.id")
+    .leftJoin(userCountQuery, "userCount.roleId", "role.id")
     .select([
       "role.uuid",
       "role.code",
@@ -416,27 +428,14 @@ function createRoleDetailQuery() {
       "role.isActive",
       "role.createdAt",
       "role.updatedAt",
+
       "company.uuid as companyUuid",
       "company.code as companyCode",
       "company.name as companyName",
-    ])
-    .select(
-      db.raw("COUNT(DISTINCT rolePermission.permissionId) as permissionCount"),
-    )
-    .select(db.raw("COUNT(DISTINCT userRole.userId) as userCount"))
-    .groupBy([
-      "role.id",
-      "role.uuid",
-      "role.code",
-      "role.name",
-      "role.description",
-      "role.isSystem",
-      "role.isActive",
-      "role.createdAt",
-      "role.updatedAt",
-      "company.uuid",
-      "company.code",
-      "company.name",
+
+      db.raw("COALESCE(permissionCount.permissionCount, 0) as permissionCount"),
+
+      db.raw("COALESCE(userCount.userCount, 0) as userCount"),
     ]);
 }
 
