@@ -1,6 +1,6 @@
 "use strict";
 
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 
 const nodemailer = require("nodemailer");
 const db = require("../lib/db")();

@@ -18,7 +18,10 @@ async function findActiveTemplates(trx, templateCodes) {
 
 function renderEmail(template, payload, fallback) {
   return {
-    subject: renderString(template?.subjectTemplate || fallback.subject, payload),
+    subject: renderString(
+      template?.subjectTemplate || fallback.subject,
+      payload,
+    ),
     html: renderString(template?.htmlTemplate || fallback.html, payload),
     text: renderString(template?.textTemplate || fallback.text, payload),
   };
