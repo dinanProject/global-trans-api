@@ -244,13 +244,16 @@ router
         });
       }
 
-      const requestsWithActions = await Promise.all(
-        requests.map(async (request) => ({
-          ...normalizeRequestResult(request),
-          details: detailsByRequestId.get(request.id) ?? [],
-          availableActions: await findAvailableActions(request.status, access),
-        })),
+      const actionsByStatus = await findAvailableActionsByStatuses(
+        requests.map((request) => request.status),
+        access,
       );
+
+      const requestsWithActions = requests.map((request) => ({
+        ...normalizeRequestResult(request),
+        details: detailsByRequestId.get(request.id) ?? [],
+        availableActions: actionsByStatus.get(request.status) ?? [],
+      }));
 
       return res.success(requestsWithActions);
     } catch (error) {
@@ -1125,6 +1128,69 @@ async function findRequestHistories(requestId, trx = db) {
       { column: "history.createdAt", order: "desc" },
       { column: "history.id", order: "desc" },
     ]);
+}
+
+async function findAvailableActionsByStatuses(statusCodes, access, trx = db) {
+  const uniqueStatusCodes = [...new Set((statusCodes ?? []).filter(Boolean))];
+
+  if (uniqueStatusCodes.length === 0) {
+    return new Map();
+  }
+
+  const transitions = await trx(
+    "equipmentRequestStatusTransitions as transition",
+  )
+    .join("equipmentRequestStatuses as destinationStatus", function () {
+      this.on("destinationStatus.code", "=", "transition.toStatusCode")
+        .andOnVal("destinationStatus.isActive", "=", 1)
+        .andOnNull("destinationStatus.deletedAt");
+    })
+    .select([
+      "transition.uuid",
+      "transition.fromStatusCode",
+      "transition.toStatusCode",
+      "destinationStatus.name as toStatusName",
+      "transition.actionCode",
+      "transition.actionName",
+      "transition.actorStage",
+      "transition.permissionCode",
+      "transition.requiresRemarks",
+      "transition.lockRequest",
+      "transition.confirmationTitle",
+      "transition.confirmationMessage",
+      "transition.sortOrder",
+    ])
+    .whereIn("transition.fromStatusCode", uniqueStatusCodes)
+    .where("transition.isActive", 1)
+    .whereNull("transition.deletedAt")
+    .orderBy([
+      { column: "transition.fromStatusCode", order: "asc" },
+      { column: "transition.sortOrder", order: "asc" },
+    ]);
+
+  const actionsByStatus = new Map();
+
+  for (const transition of transitions) {
+    if (
+      transition.permissionCode &&
+      !access.permissionCodes.includes(transition.permissionCode)
+    ) {
+      continue;
+    }
+
+    if (!actionsByStatus.has(transition.fromStatusCode)) {
+      actionsByStatus.set(transition.fromStatusCode, []);
+    }
+
+    actionsByStatus.get(transition.fromStatusCode).push({
+      ...transition,
+      requiresRemarks: Boolean(transition.requiresRemarks),
+      lockRequest: Boolean(transition.lockRequest),
+      sortOrder: Number(transition.sortOrder),
+    });
+  }
+
+  return actionsByStatus;
 }
 
 async function findAvailableActions(statusCode, access, trx = db) {
