@@ -26,7 +26,7 @@ app.use(
   }),
 );
 
-app.use("/public", express.static(path.join(process.cwd(), "public")));
+app.use("/public", express.static(path.join(__dirname, "public")));
 
 app.use("/user-session", userSessionRoutes);
 app.use("/api/v1", routes);
