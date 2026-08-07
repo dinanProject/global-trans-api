@@ -163,10 +163,25 @@ router
 
       const requestIds = requests.map((item) => item.id);
 
-      let details = [];
+      const detailSummaryByRequestId = new Map();
 
       if (requestIds.length > 0) {
-        details = await db("equipmentRequestDetails as erd")
+        const detailSummaryQuery = db("equipmentRequestDetails")
+          .select("requestId")
+          .min({ previewDetailId: "id" })
+          .count({ detailCount: "id" })
+          .whereIn("requestId", requestIds)
+          .whereNull("deletedAt")
+          .groupBy("requestId")
+          .as("detailSummary");
+
+        const detailSummaries = await db
+          .from(detailSummaryQuery)
+          .leftJoin(
+            "equipmentRequestDetails as erd",
+            "erd.id",
+            "detailSummary.previewDetailId",
+          )
           .leftJoin(
             "equipmentCategories as ec",
             "ec.id",
@@ -174,84 +189,67 @@ router
           )
           .leftJoin("equipmentUnits as eu", "eu.id", "erd.equipmentUnitId")
           .select([
-            "erd.id",
+            "detailSummary.requestId",
+            "detailSummary.detailCount",
+            "detailSummary.previewDetailId",
             "erd.uuid",
-            "erd.requestId",
-            "erd.equipmentCategoryId",
-            "erd.equipmentUnitId",
-            "erd.requiredCapacityValue",
-            "erd.requiredCapacityUnit",
-            "erd.rate",
-            "erd.remarks",
 
+            "erd.equipmentCategoryId",
             "ec.code as equipmentCategoryCode",
             "ec.name as equipmentCategoryName",
 
+            "erd.equipmentUnitId",
             "eu.unitCode as equipmentUnitCode",
             "eu.unitName as equipmentUnitName",
-            "eu.assetNumber as equipmentUnitAssetNumber",
-            "eu.modelNumber as equipmentUnitModelNumber",
-            "eu.plateNumber as equipmentUnitPlateNumber",
 
-            "eu.capacityValue as equipmentUnitCapacityValue",
-            "eu.capacityUnit as equipmentUnitCapacityUnit",
-          ])
-          .whereIn("erd.requestId", requestIds)
-          .whereNull("erd.deletedAt")
-          .orderBy("erd.id", "asc");
-      }
+            "erd.requiredCapacityValue",
+            "erd.requiredCapacityUnit",
+          ]);
 
-      const detailsByRequestId = new Map();
+        for (const detail of detailSummaries) {
+          detailSummaryByRequestId.set(detail.requestId, {
+            detailCount: Number(detail.detailCount) || 0,
+            details: detail.previewDetailId
+              ? [
+                  {
+                    uuid: detail.uuid,
 
-      for (const detail of details) {
-        if (!detailsByRequestId.has(detail.requestId)) {
-          detailsByRequestId.set(detail.requestId, []);
+                    equipmentCategoryId: detail.equipmentCategoryId,
+                    equipmentCategoryCode: detail.equipmentCategoryCode,
+                    equipmentCategoryName: detail.equipmentCategoryName,
+
+                    equipmentUnitId: detail.equipmentUnitId,
+                    equipmentUnitCode: detail.equipmentUnitCode,
+                    equipmentUnitName: detail.equipmentUnitName,
+
+                    requiredCapacityValue:
+                      detail.requiredCapacityValue === null ||
+                      detail.requiredCapacityValue === undefined
+                        ? null
+                        : Number(detail.requiredCapacityValue),
+                    requiredCapacityUnit: detail.requiredCapacityUnit,
+                  },
+                ]
+              : [],
+          });
         }
-
-        detailsByRequestId.get(detail.requestId).push({
-          id: detail.id,
-          uuid: detail.uuid,
-
-          equipmentCategoryId: detail.equipmentCategoryId,
-          equipmentCategoryCode: detail.equipmentCategoryCode,
-          equipmentCategoryName: detail.equipmentCategoryName,
-
-          equipmentUnitId: detail.equipmentUnitId,
-          equipmentUnitCode: detail.equipmentUnitCode,
-          equipmentUnitName: detail.equipmentUnitName,
-          equipmentUnitAssetNumber: detail.equipmentUnitAssetNumber,
-          equipmentUnitModelNumber: detail.equipmentUnitModelNumber,
-          equipmentUnitPlateNumber: detail.equipmentUnitPlateNumber,
-
-          requiredCapacityValue:
-            detail.requiredCapacityValue === null ||
-            detail.requiredCapacityValue === undefined
-              ? null
-              : Number(detail.requiredCapacityValue),
-          requiredCapacityUnit: detail.requiredCapacityUnit,
-
-          equipmentUnitCapacityValue:
-            detail.equipmentUnitCapacityValue === null ||
-            detail.equipmentUnitCapacityValue === undefined
-              ? null
-              : Number(detail.equipmentUnitCapacityValue),
-          equipmentUnitCapacityUnit: detail.equipmentUnitCapacityUnit,
-          rate:
-            detail.rate === null || detail.rate === undefined
-              ? null
-              : Number(detail.rate),
-          remarks: detail.remarks,
-        });
       }
 
-      const requestsWithActions = await Promise.all(
-        requests.map(async (request) => ({
-          ...normalizeRequestResult(request),
-          details: detailsByRequestId.get(request.id) ?? [],
-          availableActions: await findAvailableActions(request.status, access),
-        })),
+      const actionsByStatus = await findAvailableActionsByStatuses(
+        requests.map((request) => request.status),
+        access,
       );
 
+      const requestsWithActions = requests.map((request) => {
+        const detailSummary = detailSummaryByRequestId.get(request.id);
+
+        return {
+          ...normalizeRequestResult(request),
+          details: detailSummary?.details ?? [],
+          detailCount: detailSummary?.detailCount ?? 0,
+          availableActions: actionsByStatus.get(request.status) ?? [],
+        };
+      });
       return res.success(requestsWithActions);
     } catch (error) {
       console.error("GET /equipment-request error:", error);
@@ -1016,6 +1014,7 @@ async function findRequestDetails(requestId, trx = db) {
       "category.uuid as equipmentCategoryUuid",
       "category.code as equipmentCategoryCode",
       "category.name as equipmentCategoryName",
+      "category.icon as equipmentCategoryIcon",
       "detail.equipmentUnitId",
       "detail.requiredCapacityValue",
       "detail.requiredCapacityUnit",
@@ -1125,6 +1124,69 @@ async function findRequestHistories(requestId, trx = db) {
       { column: "history.createdAt", order: "desc" },
       { column: "history.id", order: "desc" },
     ]);
+}
+
+async function findAvailableActionsByStatuses(statusCodes, access, trx = db) {
+  const uniqueStatusCodes = [...new Set((statusCodes ?? []).filter(Boolean))];
+
+  if (uniqueStatusCodes.length === 0) {
+    return new Map();
+  }
+
+  const transitions = await trx(
+    "equipmentRequestStatusTransitions as transition",
+  )
+    .join("equipmentRequestStatuses as destinationStatus", function () {
+      this.on("destinationStatus.code", "=", "transition.toStatusCode")
+        .andOnVal("destinationStatus.isActive", "=", 1)
+        .andOnNull("destinationStatus.deletedAt");
+    })
+    .select([
+      "transition.uuid",
+      "transition.fromStatusCode",
+      "transition.toStatusCode",
+      "destinationStatus.name as toStatusName",
+      "transition.actionCode",
+      "transition.actionName",
+      "transition.actorStage",
+      "transition.permissionCode",
+      "transition.requiresRemarks",
+      "transition.lockRequest",
+      "transition.confirmationTitle",
+      "transition.confirmationMessage",
+      "transition.sortOrder",
+    ])
+    .whereIn("transition.fromStatusCode", uniqueStatusCodes)
+    .where("transition.isActive", 1)
+    .whereNull("transition.deletedAt")
+    .orderBy([
+      { column: "transition.fromStatusCode", order: "asc" },
+      { column: "transition.sortOrder", order: "asc" },
+    ]);
+
+  const actionsByStatus = new Map();
+
+  for (const transition of transitions) {
+    if (
+      transition.permissionCode &&
+      !access.permissionCodes.includes(transition.permissionCode)
+    ) {
+      continue;
+    }
+
+    if (!actionsByStatus.has(transition.fromStatusCode)) {
+      actionsByStatus.set(transition.fromStatusCode, []);
+    }
+
+    actionsByStatus.get(transition.fromStatusCode).push({
+      ...transition,
+      requiresRemarks: Boolean(transition.requiresRemarks),
+      lockRequest: Boolean(transition.lockRequest),
+      sortOrder: Number(transition.sortOrder),
+    });
+  }
+
+  return actionsByStatus;
 }
 
 async function findAvailableActions(statusCode, access, trx = db) {

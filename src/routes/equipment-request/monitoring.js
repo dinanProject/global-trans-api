@@ -1454,6 +1454,216 @@ function buildMonitoringAssignmentQuery(trx = db) {
     .where("assignment.isActive", true)
     .whereIn("assignment.statusCode", MONITORING_ASSIGNMENT_STATUS_CODES);
 }
+
+router.get(
+  "/overview",
+  authorization("EQUIPMENT_MONITORING.VIEW"),
+  async (req, res) => {
+    try {
+      const access = await getRequestAccess(req);
+      const filters = normalizeMonitoringFilters(req.query);
+
+      if (!filters.valid) {
+        return res.incomplete(filters.message);
+      }
+
+      const query = buildMonitoringAssignmentQuery().select([
+        "assignment.id",
+        "assignment.uuid",
+        "assignment.statusCode",
+        "assignment.plannedStartDate",
+        "assignment.plannedEndDate",
+        "assignment.actualStartDate",
+        "assignment.actualEndDate",
+        "assignment.assignedAt",
+        "assignment.notes",
+        "assignment.isActive",
+        "assignment.createdAt",
+        "assignment.updatedAt",
+
+        "request.uuid as requestUuid",
+        "request.requestNo",
+        "request.status as requestStatus",
+        "request.requestDate",
+        "request.startDate as requestStartDate",
+        "request.endDate as requestEndDate",
+
+        "company.uuid as companyUuid",
+        "company.code as companyCode",
+        "company.name as companyName",
+
+        "division.uuid as divisionUuid",
+        "division.code as divisionCode",
+        "division.name as divisionName",
+
+        "detail.uuid as requestDetailUuid",
+
+        "category.uuid as equipmentCategoryUuid",
+        "category.code as equipmentCategoryCode",
+        "category.name as equipmentCategoryName",
+        "category.icon as equipmentCategoryIcon",
+
+        "equipmentUnit.uuid as equipmentUnitUuid",
+        "equipmentUnit.unitCode as equipmentUnitCode",
+        "equipmentUnit.unitName as equipmentUnitName",
+        "equipmentUnit.assetNumber as assetNumber",
+      ]);
+
+      applyRequestScope(query, access, "request");
+
+      applyMonitoringFilters(query, filters, {
+        assignment: "assignment",
+        company: "company",
+        division: "division",
+        equipment: "equipmentUnit",
+      });
+
+      if (filters.status === "ACTIVE") {
+        query.andWhere((builder) => {
+          builder
+            .whereIn("assignment.statusCode", ["ASSIGNED", "IN_OPERATION"])
+            .orWhere((completedBuilder) => {
+              completedBuilder
+                .where("assignment.statusCode", "COMPLETED")
+                .whereRaw("DATE(assignment.actualEndDate) = CURRENT_DATE");
+            });
+        });
+      }
+
+      if (filters.search) {
+        const search = `%${filters.search}%`;
+
+        query.andWhere((builder) => {
+          builder
+            .where("equipmentUnit.unitCode", "like", search)
+            .orWhere("equipmentUnit.unitName", "like", search)
+            .orWhere("equipmentUnit.assetNumber", "like", search)
+            .orWhere("request.requestNo", "like", search)
+            .orWhere("company.code", "like", search)
+            .orWhere("company.name", "like", search)
+            .orWhere("division.code", "like", search)
+            .orWhere("division.name", "like", search)
+            .orWhere("category.code", "like", search)
+            .orWhere("category.name", "like", search);
+        });
+      }
+
+      const availableUnitQuery = db("equipmentUnits as equipmentUnit")
+        .where("equipmentUnit.isActive", true)
+        .whereNull("equipmentUnit.deletedAt")
+        .whereNotExists(function () {
+          this.select(db.raw("1"))
+            .from("equipmentAssignments as activeAssignment")
+            .whereRaw("activeAssignment.equipmentUnitId = equipmentUnit.id")
+            .where("activeAssignment.isActive", true)
+            .whereNull("activeAssignment.deletedAt")
+            .whereNot("activeAssignment.statusCode", "CANCELLED")
+            .andWhere((builder) => {
+              builder.whereNull("activeAssignment.actualEndDate").orWhereRaw(
+                `
+                  GREATEST(
+                    activeAssignment.plannedEndDate,
+                    activeAssignment.actualEndDate
+                  ) >= NOW()
+                  `,
+              );
+            });
+        })
+        .count({ total: "equipmentUnit.id" })
+        .first();
+
+      const [assignmentRows, availableUnitResult] = await Promise.all([
+        query.orderBy([
+          {
+            column: "assignment.plannedStartDate",
+            order: "asc",
+          },
+          {
+            column: "request.requestNo",
+            order: "asc",
+          },
+          {
+            column: "assignment.id",
+            order: "asc",
+          },
+        ]),
+        availableUnitQuery,
+      ]);
+
+      let assignments = assignmentRows.map((assignment) => {
+        const monitoring = calculateAssignmentMonitoring(assignment);
+
+        return {
+          ...assignment,
+          isActive: Boolean(assignment.isActive),
+          operationStatus: monitoring.operationStatus,
+          slaStatus: monitoring.slaStatus,
+          remainingDays: monitoring.remainingDays,
+          isOverdue: monitoring.isOverdue,
+          isLateStart: monitoring.isLateStart,
+          isCompletedToday: monitoring.isCompletedToday,
+        };
+      });
+
+      if (filters.status && !["ACTIVE", "ALL"].includes(filters.status)) {
+        assignments = assignments.filter((assignment) => {
+          return (
+            assignment.statusCode === filters.status ||
+            assignment.requestStatus === filters.status ||
+            assignment.operationStatus === filters.status ||
+            assignment.slaStatus === filters.status
+          );
+        });
+      }
+
+      if (filters.overdueOnly) {
+        assignments = assignments.filter((assignment) => assignment.isOverdue);
+      }
+
+      const summary = {
+        activeOperation: 0,
+        assignedWaitingStart: 0,
+        overdue: 0,
+        lateStart: 0,
+        completedToday: 0,
+        availableUnit: Number(availableUnitResult?.total || 0),
+      };
+
+      assignments.forEach((assignment) => {
+        if (assignment.actualStartDate && !assignment.actualEndDate) {
+          summary.activeOperation += 1;
+        }
+
+        if (!assignment.actualStartDate && !assignment.actualEndDate) {
+          summary.assignedWaitingStart += 1;
+        }
+
+        if (assignment.isOverdue) {
+          summary.overdue += 1;
+        }
+
+        if (assignment.isLateStart) {
+          summary.lateStart += 1;
+        }
+
+        if (assignment.isCompletedToday) {
+          summary.completedToday += 1;
+        }
+      });
+
+      return res.success({
+        summary,
+        assignments,
+      });
+    } catch (error) {
+      console.error("GET /equipment-request/monitoring/overview error:", error);
+
+      return res.fail(
+        error.message || "Failed to load equipment monitoring overview.",
+      );
+    }
+  },
+);
 /**
  * GET /equipment-request/monitoring/summary
  *
