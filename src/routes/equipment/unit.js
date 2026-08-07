@@ -6,61 +6,76 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 const db = require("../../lib/db")();
 
 router.use(authentication);
 
 router
-  .get("/", async (req, res) => {
-    try {
-      const { search, categoryUuid, isActive } = req.query;
+  .get(
+    "/",
+    authorization(
+      [
+        "EQUIPMENT_UNIT.VIEW",
+        "EQUIPMENT_REQUEST.VIEW",
+        "EQUIPMENT_REQUEST.CREATE",
+        "EQUIPMENT_REQUEST.UPDATE",
+      ],
+      {
+        requireAll: false,
+      },
+    ),
+    async (req, res) => {
+      try {
+        const { search, categoryUuid, isActive } = req.query;
 
-      const query = createEquipmentUnitQuery();
+        const query = createEquipmentUnitQuery();
 
-      if (search) {
-        const normalizedSearch = `%${String(search).trim()}%`;
+        if (search) {
+          const normalizedSearch = `%${String(search).trim()}%`;
 
-        query.andWhere((builder) => {
-          builder
-            .where("unit.unitCode", "like", normalizedSearch)
-            .orWhere("unit.unitName", "like", normalizedSearch)
-            .orWhere("unit.assetNumber", "like", normalizedSearch)
-            .orWhere("unit.modelNumber", "like", normalizedSearch)
-            .orWhere("unit.plateNumber", "like", normalizedSearch)
-            .orWhere("unit.remarks", "like", normalizedSearch)
-            .orWhere("category.code", "like", normalizedSearch)
-            .orWhere("category.name", "like", normalizedSearch);
-        });
+          query.andWhere((builder) => {
+            builder
+              .where("unit.unitCode", "like", normalizedSearch)
+              .orWhere("unit.unitName", "like", normalizedSearch)
+              .orWhere("unit.assetNumber", "like", normalizedSearch)
+              .orWhere("unit.modelNumber", "like", normalizedSearch)
+              .orWhere("unit.plateNumber", "like", normalizedSearch)
+              .orWhere("unit.remarks", "like", normalizedSearch)
+              .orWhere("category.code", "like", normalizedSearch)
+              .orWhere("category.name", "like", normalizedSearch);
+          });
+        }
+
+        if (categoryUuid) {
+          query.andWhere("category.uuid", String(categoryUuid).trim());
+        }
+
+        if (isActive !== undefined) {
+          query.andWhere("unit.isActive", parseBooleanQuery(isActive));
+        }
+
+        const units = await query.orderBy([
+          {
+            column: "unit.unitName",
+            order: "asc",
+          },
+          {
+            column: "unit.unitCode",
+            order: "asc",
+          },
+        ]);
+
+        return res.success(units);
+      } catch (error) {
+        console.error("GET /equipment-unit error:", error);
+
+        return res.fail(error.message || "Failed to load equipment units.");
       }
+    },
+  )
 
-      if (categoryUuid) {
-        query.andWhere("category.uuid", String(categoryUuid).trim());
-      }
-
-      if (isActive !== undefined) {
-        query.andWhere("unit.isActive", parseBooleanQuery(isActive));
-      }
-
-      const units = await query.orderBy([
-        {
-          column: "unit.unitName",
-          order: "asc",
-        },
-        {
-          column: "unit.unitCode",
-          order: "asc",
-        },
-      ]);
-
-      return res.success(units);
-    } catch (error) {
-      console.error("GET /equipment-unit error:", error);
-
-      return res.fail(error.message || "Failed to load equipment units.");
-    }
-  })
-
-  .get("/:uuid", async (req, res) => {
+  .get("/:uuid", authorization("EQUIPMENT_UNIT.VIEW"), async (req, res) => {
     try {
       const unit = await findEquipmentUnitByUuid(req.params.uuid);
 
@@ -76,7 +91,7 @@ router
     }
   })
 
-  .post("/", async (req, res) => {
+  .post("/", authorization("EQUIPMENT_UNIT.CREATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -105,6 +120,19 @@ router
 
         return res.incomplete(
           `Equipment category "${category.name}" sudah tidak aktif.`,
+        );
+      }
+
+      const capacityUnitLookup = await findCapacityUnitLookup(
+        trx,
+        payload.capacityUnit,
+      );
+
+      if (!capacityUnitLookup) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Equipment capacity unit "${payload.capacityUnit}" tidak valid atau tidak aktif.`,
         );
       }
 
@@ -166,6 +194,8 @@ router
         assetNumber: payload.assetNumber,
         modelNumber: payload.modelNumber,
         plateNumber: payload.plateNumber,
+        capacityValue: payload.capacityValue,
+        capacityUnit: capacityUnitLookup.lookupCode,
         remarks: payload.remarks,
         isActive: payload.isActive,
         createdAt: now,
@@ -190,7 +220,7 @@ router
   /**
    * PUT /equipment-unit/:uuid
    */
-  .put("/:uuid", async (req, res) => {
+  .put("/:uuid", authorization("EQUIPMENT_UNIT.UPDATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -230,6 +260,19 @@ router
 
         return res.incomplete(
           `Equipment category "${category.name}" sudah tidak aktif.`,
+        );
+      }
+
+      const capacityUnitLookup = await findCapacityUnitLookup(
+        trx,
+        payload.capacityUnit,
+      );
+
+      if (!capacityUnitLookup) {
+        await trx.rollback();
+
+        return res.incomplete(
+          `Equipment capacity unit "${payload.capacityUnit}" tidak valid atau tidak aktif.`,
         );
       }
 
@@ -290,6 +333,8 @@ router
         assetNumber: payload.assetNumber,
         modelNumber: payload.modelNumber,
         plateNumber: payload.plateNumber,
+        capacityValue: payload.capacityValue,
+        capacityUnit: capacityUnitLookup.lookupCode,
         remarks: payload.remarks,
         isActive: payload.isActive,
         updatedAt: db.fn.now(),
@@ -314,45 +359,49 @@ router
    *
    * Soft delete.
    */
-  .delete("/:uuid", async (req, res) => {
-    const trx = await db.transaction();
+  .delete(
+    "/:uuid",
+    authorization("EQUIPMENT_UNIT.DELETE"),
+    async (req, res) => {
+      const trx = await db.transaction();
 
-    try {
-      const unit = await trx("equipmentUnits")
-        .where("uuid", req.params.uuid)
-        .whereNull("deletedAt")
-        .first();
+      try {
+        const unit = await trx("equipmentUnits")
+          .where("uuid", req.params.uuid)
+          .whereNull("deletedAt")
+          .first();
 
-      if (!unit) {
-        await trx.rollback();
+        if (!unit) {
+          await trx.rollback();
 
-        return res.incomplete("Equipment unit tidak ditemukan.");
+          return res.incomplete("Equipment unit tidak ditemukan.");
+        }
+
+        /*
+         * Ketika transaksi rental sudah dibuat, validasi pemakaian unit
+         * dapat ditambahkan di sini sebelum unit dihapus.
+         */
+
+        await trx("equipmentUnits").where("id", unit.id).update({
+          isActive: false,
+          deletedAt: db.fn.now(),
+          updatedAt: db.fn.now(),
+        });
+
+        await trx.commit();
+
+        return res.success({
+          uuid: unit.uuid,
+        });
+      } catch (error) {
+        await rollbackTransaction(trx);
+
+        console.error("DELETE /equipment-unit/:uuid error:", error);
+
+        return res.fail(error.message || "Failed to delete equipment unit.");
       }
-
-      /*
-       * Ketika transaksi rental sudah dibuat, validasi pemakaian unit
-       * dapat ditambahkan di sini sebelum unit dihapus.
-       */
-
-      await trx("equipmentUnits").where("id", unit.id).update({
-        isActive: false,
-        deletedAt: db.fn.now(),
-        updatedAt: db.fn.now(),
-      });
-
-      await trx.commit();
-
-      return res.success({
-        uuid: unit.uuid,
-      });
-    } catch (error) {
-      await rollbackTransaction(trx);
-
-      console.error("DELETE /equipment-unit/:uuid error:", error);
-
-      return res.fail(error.message || "Failed to delete equipment unit.");
-    }
-  });
+    },
+  );
 
 function createEquipmentUnitQuery(database = db) {
   return database("equipmentUnits as unit")
@@ -361,6 +410,12 @@ function createEquipmentUnitQuery(database = db) {
       "category.id",
       "unit.categoryId",
     )
+    .leftJoin("sysLookups as capacityLookup", function () {
+      this.on("capacityLookup.lookupCode", "=", "unit.capacityUnit")
+        .andOnVal("capacityLookup.lookupGroup", "=", "equipment_capacity_unit")
+        .andOnVal("capacityLookup.isActive", "=", 1)
+        .andOnNull("capacityLookup.deletedAt");
+    })
     .select([
       "unit.id",
       "unit.uuid",
@@ -374,6 +429,10 @@ function createEquipmentUnitQuery(database = db) {
       "unit.assetNumber",
       "unit.modelNumber",
       "unit.plateNumber",
+      "unit.capacityValue",
+      "unit.capacityUnit",
+      "capacityLookup.lookupValue as capacityUnitName",
+      "capacityLookup.lookupAlias as capacityUnitAlias",
       "unit.remarks",
       "unit.isActive",
       "unit.createdAt",
@@ -386,6 +445,15 @@ async function findEquipmentUnitByUuid(uuid) {
   return createEquipmentUnitQuery().where("unit.uuid", uuid).first();
 }
 
+async function findCapacityUnitLookup(database, capacityUnit) {
+  return database("sysLookups")
+    .where("lookupGroup", "equipment_capacity_unit")
+    .whereRaw("UPPER(lookupCode) = ?", [capacityUnit])
+    .where("isActive", 1)
+    .whereNull("deletedAt")
+    .first(["lookupId", "lookupCode", "lookupValue", "lookupAlias"]);
+}
+
 function normalizePayload(payload = {}) {
   return {
     categoryUuid: normalizeRequiredString(payload.categoryUuid),
@@ -394,6 +462,8 @@ function normalizePayload(payload = {}) {
     assetNumber: normalizeNullableString(payload.assetNumber),
     modelNumber: normalizeNullableString(payload.modelNumber),
     plateNumber: normalizeNullableString(payload.plateNumber),
+    capacityValue: normalizePositiveDecimal(payload.capacityValue),
+    capacityUnit: normalizeRequiredString(payload.capacityUnit).toUpperCase(),
     remarks: normalizeNullableString(payload.remarks),
     isActive: normalizeBoolean(payload.isActive, true),
   };
@@ -464,6 +534,27 @@ function validatePayload(payload) {
     };
   }
 
+  if (!payload.capacityValue) {
+    return {
+      valid: false,
+      message: "Equipment capacity value wajib lebih dari 0.",
+    };
+  }
+
+  if (!payload.capacityUnit) {
+    return {
+      valid: false,
+      message: "Equipment capacity unit wajib dipilih.",
+    };
+  }
+
+  if (payload.capacityUnit.length > 50) {
+    return {
+      valid: false,
+      message: "Equipment capacity unit maksimal 50 karakter.",
+    };
+  }
+
   if (payload.remarks && payload.remarks.length > 500) {
     return {
       valid: false,
@@ -492,6 +583,20 @@ function normalizeNullableString(value) {
   const normalizedValue = String(value).trim();
 
   return normalizedValue || null;
+}
+
+function normalizePositiveDecimal(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const normalizedValue = Number(value);
+
+  if (!Number.isFinite(normalizedValue) || normalizedValue <= 0) {
+    return null;
+  }
+
+  return normalizedValue;
 }
 
 function normalizeBoolean(value, defaultValue = false) {

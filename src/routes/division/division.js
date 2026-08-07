@@ -5,6 +5,7 @@ const express = require("express");
 
 const db = require("../../lib/db")();
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 
 const router = express.Router();
 
@@ -23,74 +24,88 @@ router
    * companyUuid
    * isActive
    */
-  .get("/", async (req, res, next) => {
-    try {
-      const filters = normalizeListFilters(req.query);
+  .get(
+    "/",
+    authorization(
+      [
+        "DIVISION.VIEW",
+        "EQUIPMENT_REQUEST.VIEW",
+        "EQUIPMENT_REQUEST.CREATE",
+        "EQUIPMENT_REQUEST.UPDATE",
+      ],
+      {
+        requireAll: false,
+      },
+    ),
+    async (req, res, next) => {
+      try {
+        const filters = normalizeListFilters(req.query);
 
-      const query = db("divisions as division")
-        .join("companies as company", "company.id", "division.companyId")
-        .select([
-          "division.id",
-          "division.uuid",
-          "division.companyId",
-          "company.uuid as companyUuid",
-          "company.code as companyCode",
-          "company.name as companyName",
-          "division.code",
-          "division.name",
-          "division.description",
-          "division.isActive",
-          "division.createdAt",
-          "division.updatedAt",
-        ])
-        .whereNull("division.deletedAt")
-        .whereNull("company.deletedAt");
+        const query = db("divisions as division")
+          .join("companies as company", "company.id", "division.companyId")
+          .select([
+            "division.id",
+            "division.uuid",
+            "division.companyId",
+            "company.uuid as companyUuid",
+            "company.code as companyCode",
+            "company.name as companyName",
+            "division.code",
+            "division.name",
+            "division.description",
+            "division.isActive",
+            "division.createdAt",
+            "division.updatedAt",
+          ])
+          .whereNull("division.deletedAt")
+          .whereNull("company.deletedAt");
 
-      if (filters.companyUuid) {
-        query.where("company.uuid", filters.companyUuid);
+        if (filters.companyUuid) {
+          query.where("company.uuid", filters.companyUuid);
+        }
+
+        if (filters.isActive !== null) {
+          query.where("division.isActive", filters.isActive);
+        }
+
+        if (filters.search) {
+          query.andWhere((builder) => {
+            builder
+              .whereRaw("LOWER(division.code) LIKE ?", [
+                `%${filters.search.toLowerCase()}%`,
+              ])
+              .orWhereRaw("LOWER(division.name) LIKE ?", [
+                `%${filters.search.toLowerCase()}%`,
+              ])
+              .orWhereRaw("LOWER(company.name) LIKE ?", [
+                `%${filters.search.toLowerCase()}%`,
+              ]);
+          });
+        }
+
+        const divisions = await query
+          .orderBy("company.name", "asc")
+          .orderBy("division.name", "asc")
+          .orderBy("division.id", "asc");
+
+        return res.success(
+          divisions.map((division) => ({
+            ...division,
+            isActive: Boolean(division.isActive),
+          })),
+        );
+      } catch (error) {
+        return next(error);
       }
-
-      if (filters.isActive !== null) {
-        query.where("division.isActive", filters.isActive);
-      }
-
-      if (filters.search) {
-        query.andWhere((builder) => {
-          builder
-            .whereRaw("LOWER(division.code) LIKE ?", [
-              `%${filters.search.toLowerCase()}%`,
-            ])
-            .orWhereRaw("LOWER(division.name) LIKE ?", [
-              `%${filters.search.toLowerCase()}%`,
-            ])
-            .orWhereRaw("LOWER(company.name) LIKE ?", [
-              `%${filters.search.toLowerCase()}%`,
-            ]);
-        });
-      }
-
-      const divisions = await query
-        .orderBy("company.name", "asc")
-        .orderBy("division.name", "asc")
-        .orderBy("division.id", "asc");
-
-      return res.success(
-        divisions.map((division) => ({
-          ...division,
-          isActive: Boolean(division.isActive),
-        })),
-      );
-    } catch (error) {
-      return next(error);
-    }
-  })
+    },
+  )
 
   /**
    * GET /division/:uuid
    *
    * Mendapatkan detail satu division.
    */
-  .get("/:uuid", async (req, res, next) => {
+  .get("/:uuid", authorization("DIVISION.VIEW"), async (req, res, next) => {
     try {
       const division = await getDivisionDetail(req.params.uuid);
 
@@ -112,7 +127,7 @@ router
    *
    * Membuat division baru.
    */
-  .post("/", async (req, res, next) => {
+  .post("/", authorization("DIVISION.CREATE"), async (req, res, next) => {
     try {
       const payload = normalizePayload(req.body);
       const validationMessage = validatePayload(payload);
@@ -190,7 +205,7 @@ router
    *
    * Karena menggunakan PUT, kirim payload lengkap.
    */
-  .put("/:uuid", async (req, res, next) => {
+  .put("/:uuid", authorization("DIVISION.UPDATE"), async (req, res, next) => {
     try {
       const existingDivision = await db("divisions")
         .select(["id", "uuid", "companyId", "code", "name", "isActive"])
@@ -296,48 +311,52 @@ router
    * - department aktif
    * - user aktif
    */
-  .delete("/:uuid", async (req, res, next) => {
-    try {
-      const division = await db("divisions")
-        .select([
-          "id",
-          "uuid",
-          "companyId",
-          "code",
-          "name",
-          "isActive",
-          "deletedAt",
-        ])
-        .where("uuid", req.params.uuid)
-        .first();
+  .delete(
+    "/:uuid",
+    authorization("DIVISION.DELETE"),
+    async (req, res, next) => {
+      try {
+        const division = await db("divisions")
+          .select([
+            "id",
+            "uuid",
+            "companyId",
+            "code",
+            "name",
+            "isActive",
+            "deletedAt",
+          ])
+          .where("uuid", req.params.uuid)
+          .first();
 
-      if (!division || division.deletedAt) {
-        return res.fail("Division tidak ditemukan");
-      }
+        if (!division || division.deletedAt) {
+          return res.fail("Division tidak ditemukan");
+        }
 
-      const dependencyMessage = await getDeleteDependencyMessage(division.id);
+        const dependencyMessage = await getDeleteDependencyMessage(division.id);
 
-      if (dependencyMessage) {
-        return res.fail(dependencyMessage);
-      }
+        if (dependencyMessage) {
+          return res.fail(dependencyMessage);
+        }
 
-      await db("divisions").where("id", division.id).update({
-        isActive: false,
-        deletedAt: db.fn.now(),
-        updatedAt: db.fn.now(),
-      });
-
-      return res.success(
-        {
-          uuid: division.uuid,
+        await db("divisions").where("id", division.id).update({
           isActive: false,
-        },
-        "Division berhasil dihapus",
-      );
-    } catch (error) {
-      return next(error);
-    }
-  });
+          deletedAt: db.fn.now(),
+          updatedAt: db.fn.now(),
+        });
+
+        return res.success(
+          {
+            uuid: division.uuid,
+            isActive: false,
+          },
+          "Division berhasil dihapus",
+        );
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
 
 async function getDivisionDetail(uuid) {
   return db("divisions as division")

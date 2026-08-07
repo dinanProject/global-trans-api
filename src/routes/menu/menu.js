@@ -5,6 +5,7 @@ const express = require("express");
 
 const db = require("../../lib/db")();
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 const router = express.Router();
 
 router.use(authentication);
@@ -51,7 +52,7 @@ async function getPermissionPrimaryKey() {
  */
 router
 
-  .get("/", async (req, res, next) => {
+  .get("/", authorization("MENU.VIEW"), async (req, res, next) => {
     try {
       const permissionPrimaryKey = await getPermissionPrimaryKey();
 
@@ -132,7 +133,7 @@ router
    *
    * Mendapatkan detail satu menu.
    */
-  .get("/:uuid", async (req, res, next) => {
+  .get("/:uuid", authorization("MENU.VIEW"), async (req, res, next) => {
     try {
       const permissionPrimaryKey = await getPermissionPrimaryKey();
 
@@ -182,7 +183,7 @@ router
    *
    * Membuat menu baru.
    */
-  .post("/", async (req, res, next) => {
+  .post("/", authorization("MENU.CREATE"), async (req, res, next) => {
     try {
       const payload = normalizePayload(req.body);
       const validationMessage = validatePayload(payload);
@@ -264,7 +265,7 @@ router
    *
    * Karena menggunakan PUT, kirim payload lengkap.
    */
-  .put("/:uuid", async (req, res, next) => {
+  .put("/:uuid", authorization("MENU.UPDATE"), async (req, res, next) => {
     try {
       const existingMenu = await db("menus")
         .select(["menuId", "uuid", "parentId", "code", "menuName", "isActive"])
@@ -372,7 +373,7 @@ router
    * Tidak menghapus data secara fisik.
    * Hanya mengubah isActive menjadi false.
    */
-  .delete("/:uuid", async (req, res, next) => {
+  .delete("/:uuid", authorization("MENU.DELETE"), async (req, res, next) => {
     const protectedMenuCodes = ["SYSTEM.MANAGEMENT", "SYSTEM.MANAGEMENT.MENU"];
     try {
       const menu = await db("menus")

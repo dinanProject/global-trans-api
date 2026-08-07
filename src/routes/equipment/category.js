@@ -6,6 +6,7 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 const db = require("../../lib/db")();
 
 router.use(authentication);
@@ -18,62 +19,78 @@ router.use(authentication);
  * - isActive
  */
 router
-  .get("/", async (req, res) => {
-    try {
-      const { search, isActive } = req.query;
+  .get(
+    "/",
+    authorization(
+      [
+        "EQUIPMENT_CATEGORY.VIEW",
+        "EQUIPMENT_REQUEST.VIEW",
+        "EQUIPMENT_REQUEST.CREATE",
+        "EQUIPMENT_REQUEST.UPDATE",
+      ],
+      {
+        requireAll: false,
+      },
+    ),
+    async (req, res) => {
+      try {
+        const { search, isActive } = req.query;
 
-      const query = db("equipmentCategories as category")
-        .select([
-          "category.id",
-          "category.uuid",
-          "category.code",
-          "category.name",
-          "category.description",
-          "category.icon",
-          "category.isActive",
-          "category.createdAt",
-          "category.updatedAt",
-        ])
-        .whereNull("category.deletedAt");
+        const query = db("equipmentCategories as category")
+          .select([
+            "category.id",
+            "category.uuid",
+            "category.code",
+            "category.name",
+            "category.description",
+            "category.icon",
+            "category.isActive",
+            "category.createdAt",
+            "category.updatedAt",
+          ])
+          .whereNull("category.deletedAt");
 
-      if (search) {
-        const normalizedSearch = `%${String(search).trim()}%`;
+        if (search) {
+          const normalizedSearch = `%${String(search).trim()}%`;
 
-        query.andWhere((builder) => {
-          builder
-            .where("category.code", "like", normalizedSearch)
-            .orWhere("category.name", "like", normalizedSearch)
-            .orWhere("category.description", "like", normalizedSearch);
-        });
+          query.andWhere((builder) => {
+            builder
+              .where("category.code", "like", normalizedSearch)
+              .orWhere("category.name", "like", normalizedSearch)
+              .orWhere("category.description", "like", normalizedSearch);
+          });
+        }
+
+        if (isActive !== undefined) {
+          query.andWhere("category.isActive", parseBooleanQuery(isActive));
+        }
+
+        const categories = await query.orderBy([
+          {
+            column: "category.name",
+            order: "asc",
+          },
+          {
+            column: "category.code",
+            order: "asc",
+          },
+        ]);
+
+        return res.success(categories);
+      } catch (error) {
+        console.error("GET /equipment-category error:", error);
+
+        return res.fail(
+          error.message || "Failed to load equipment categories.",
+        );
       }
-
-      if (isActive !== undefined) {
-        query.andWhere("category.isActive", parseBooleanQuery(isActive));
-      }
-
-      const categories = await query.orderBy([
-        {
-          column: "category.name",
-          order: "asc",
-        },
-        {
-          column: "category.code",
-          order: "asc",
-        },
-      ]);
-
-      return res.success(categories);
-    } catch (error) {
-      console.error("GET /equipment-category error:", error);
-
-      return res.fail(error.message || "Failed to load equipment categories.");
-    }
-  })
+    },
+  )
 
   /**
    * GET /equipment-category/:uuid
    */
-  .get("/:uuid", async (req, res) => {
+  .get("/:uuid", authorization("EQUIPMENT_CATEGORY.VIEW"), async (req, res) => {
     try {
       const category = await findEquipmentCategoryByUuid(req.params.uuid);
 
@@ -92,7 +109,7 @@ router
   /**
    * POST /equipment-category
    */
-  .post("/", async (req, res) => {
+  .post("/", authorization("EQUIPMENT_CATEGORY.CREATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -163,146 +180,160 @@ router
   /**
    * PUT /equipment-category/:uuid
    */
-  .put("/:uuid", async (req, res) => {
-    const trx = await db.transaction();
+  .put(
+    "/:uuid",
+    authorization("EQUIPMENT_CATEGORY.UPDATE"),
+    async (req, res) => {
+      const trx = await db.transaction();
 
-    try {
-      const existingCategory = await trx("equipmentCategories")
-        .where("uuid", req.params.uuid)
-        .whereNull("deletedAt")
-        .first();
+      try {
+        const existingCategory = await trx("equipmentCategories")
+          .where("uuid", req.params.uuid)
+          .whereNull("deletedAt")
+          .first();
 
-      if (!existingCategory) {
+        if (!existingCategory) {
+          await trx.rollback();
+
+          return res.incomplete("Equipment category tidak ditemukan.");
+        }
+
+        const payload = normalizePayload(req.body);
+        const validation = validatePayload(payload);
+
+        if (!validation.valid) {
+          await trx.rollback();
+
+          return res.incomplete(validation.message);
+        }
+
+        const duplicateCode = await trx("equipmentCategories")
+          .whereRaw("UPPER(code) = ?", [payload.code])
+          .whereNot("id", existingCategory.id)
+          .whereNull("deletedAt")
+          .first("id");
+
+        if (duplicateCode) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Equipment category code "${payload.code}" sudah digunakan.`,
+          );
+        }
+
+        const duplicateName = await trx("equipmentCategories")
+          .whereRaw("UPPER(name) = ?", [payload.name.toUpperCase()])
+          .whereNot("id", existingCategory.id)
+          .whereNull("deletedAt")
+          .first("id");
+
+        if (duplicateName) {
+          await trx.rollback();
+
+          return res.incomplete(
+            `Equipment category name "${payload.name}" sudah digunakan.`,
+          );
+        }
+
+        /*
+         * Nanti ketika equipmentTypes sudah dibuat, validasi saat
+         * category dinonaktifkan ditambahkan di sini:
+         *
+         * if (existingCategory.isActive && !payload.isActive) {
+         *   cek equipment type aktif yang memakai category ini.
+         * }
+         */
+
+        await trx("equipmentCategories")
+          .where("id", existingCategory.id)
+          .update({
+            code: payload.code,
+            name: payload.name,
+            description: payload.description,
+            icon: payload.icon,
+            isActive: payload.isActive,
+            updatedAt: db.fn.now(),
+          });
+
+        await trx.commit();
+
+        const category = await findEquipmentCategoryByUuid(req.params.uuid);
+
+        return res.success(category);
+      } catch (error) {
         await trx.rollback();
 
-        return res.incomplete("Equipment category tidak ditemukan.");
-      }
+        console.error("PUT /equipment-category/:uuid error:", error);
 
-      const payload = normalizePayload(req.body);
-      const validation = validatePayload(payload);
-
-      if (!validation.valid) {
-        await trx.rollback();
-
-        return res.incomplete(validation.message);
-      }
-
-      const duplicateCode = await trx("equipmentCategories")
-        .whereRaw("UPPER(code) = ?", [payload.code])
-        .whereNot("id", existingCategory.id)
-        .whereNull("deletedAt")
-        .first("id");
-
-      if (duplicateCode) {
-        await trx.rollback();
-
-        return res.incomplete(
-          `Equipment category code "${payload.code}" sudah digunakan.`,
+        return res.fail(
+          error.message || "Failed to update equipment category.",
         );
       }
-
-      const duplicateName = await trx("equipmentCategories")
-        .whereRaw("UPPER(name) = ?", [payload.name.toUpperCase()])
-        .whereNot("id", existingCategory.id)
-        .whereNull("deletedAt")
-        .first("id");
-
-      if (duplicateName) {
-        await trx.rollback();
-
-        return res.incomplete(
-          `Equipment category name "${payload.name}" sudah digunakan.`,
-        );
-      }
-
-      /*
-       * Nanti ketika equipmentTypes sudah dibuat, validasi saat
-       * category dinonaktifkan ditambahkan di sini:
-       *
-       * if (existingCategory.isActive && !payload.isActive) {
-       *   cek equipment type aktif yang memakai category ini.
-       * }
-       */
-
-      await trx("equipmentCategories").where("id", existingCategory.id).update({
-        code: payload.code,
-        name: payload.name,
-        description: payload.description,
-        icon: payload.icon,
-        isActive: payload.isActive,
-        updatedAt: db.fn.now(),
-      });
-
-      await trx.commit();
-
-      const category = await findEquipmentCategoryByUuid(req.params.uuid);
-
-      return res.success(category);
-    } catch (error) {
-      await trx.rollback();
-
-      console.error("PUT /equipment-category/:uuid error:", error);
-
-      return res.fail(error.message || "Failed to update equipment category.");
-    }
-  })
+    },
+  )
 
   /**
    * DELETE /equipment-category/:uuid
    *
    * Soft delete.
    */
-  .delete("/:uuid", async (req, res) => {
-    const trx = await db.transaction();
+  .delete(
+    "/:uuid",
+    authorization("EQUIPMENT_CATEGORY.DELETE"),
+    async (req, res) => {
+      const trx = await db.transaction();
 
-    try {
-      const category = await trx("equipmentCategories")
-        .where("uuid", req.params.uuid)
-        .whereNull("deletedAt")
-        .first();
+      try {
+        const category = await trx("equipmentCategories")
+          .where("uuid", req.params.uuid)
+          .whereNull("deletedAt")
+          .first();
 
-      if (!category) {
+        if (!category) {
+          await trx.rollback();
+
+          return res.incomplete("Equipment category tidak ditemukan.");
+        }
+
+        /*
+         * Setelah equipmentTypes dibuat, tambahkan:
+         *
+         * const equipmentType = await trx("equipmentTypes")
+         *   .where("categoryId", category.id)
+         *   .whereNull("deletedAt")
+         *   .first("id");
+         *
+         * if (equipmentType) {
+         *   await trx.rollback();
+         *
+         *   return res.incomplete(
+         *     "Equipment category tidak dapat dihapus karena masih digunakan oleh equipment type.",
+         *   );
+         * }
+         */
+
+        await trx("equipmentCategories").where("id", category.id).update({
+          isActive: false,
+          deletedAt: db.fn.now(),
+          updatedAt: db.fn.now(),
+        });
+
+        await trx.commit();
+
+        return res.success({
+          uuid: category.uuid,
+        });
+      } catch (error) {
         await trx.rollback();
 
-        return res.incomplete("Equipment category tidak ditemukan.");
+        console.error("DELETE /equipment-category/:uuid error:", error);
+
+        return res.fail(
+          error.message || "Failed to delete equipment category.",
+        );
       }
-
-      /*
-       * Setelah equipmentTypes dibuat, tambahkan:
-       *
-       * const equipmentType = await trx("equipmentTypes")
-       *   .where("categoryId", category.id)
-       *   .whereNull("deletedAt")
-       *   .first("id");
-       *
-       * if (equipmentType) {
-       *   await trx.rollback();
-       *
-       *   return res.incomplete(
-       *     "Equipment category tidak dapat dihapus karena masih digunakan oleh equipment type.",
-       *   );
-       * }
-       */
-
-      await trx("equipmentCategories").where("id", category.id).update({
-        isActive: false,
-        deletedAt: db.fn.now(),
-        updatedAt: db.fn.now(),
-      });
-
-      await trx.commit();
-
-      return res.success({
-        uuid: category.uuid,
-      });
-    } catch (error) {
-      await trx.rollback();
-
-      console.error("DELETE /equipment-category/:uuid error:", error);
-
-      return res.fail(error.message || "Failed to delete equipment category.");
-    }
-  });
+    },
+  );
 
 async function findEquipmentCategoryByUuid(uuid) {
   return db("equipmentCategories as category")

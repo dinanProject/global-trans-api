@@ -6,6 +6,7 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 
 const authentication = require("../../lib/authentication");
+const authorization = require("../../lib/authorization");
 const db = require("../../lib/db")();
 
 const HOLDER_COMPANY_TYPE = 1;
@@ -40,77 +41,91 @@ router.use(authentication);
  * - isActive
  */
 router
-  .get("/", async (req, res) => {
-    try {
-      const { search, type, isActive } = req.query;
+  .get(
+    "/",
+    authorization(
+      [
+        "COMPANY.VIEW",
+        "EQUIPMENT_REQUEST.VIEW",
+        "EQUIPMENT_REQUEST.CREATE",
+        "EQUIPMENT_REQUEST.UPDATE",
+      ],
+      {
+        requireAll: false,
+      },
+    ),
+    async (req, res) => {
+      try {
+        const { search, type, isActive } = req.query;
 
-      const query = db("companies as company")
-        .leftJoin("sysLookups as companyType", function () {
-          this.on("companyType.lookupId", "=", "company.type")
-            .andOnVal("companyType.lookupGroup", "=", "company_type")
-            .andOnVal("companyType.isActive", "=", 1);
-        })
-        .select([
-          "company.id",
-          "company.uuid",
-          "company.code",
-          "company.name",
-          "company.type as typeId",
-          "companyType.lookupCode as typeCode",
-          "companyType.lookupValue as typeName",
-          "company.isActive",
-          "company.taxNumber",
-          "company.email",
-          "company.phone",
-          "company.address",
-          "company.city",
-          "company.province",
-          "company.postalCode",
-          "company.createdAt",
-          "company.updatedAt",
-        ])
-        .whereNull("company.deletedAt");
+        const query = db("companies as company")
+          .leftJoin("sysLookups as companyType", function () {
+            this.on("companyType.lookupId", "=", "company.type")
+              .andOnVal("companyType.lookupGroup", "=", "company_type")
+              .andOnVal("companyType.isActive", "=", 1);
+          })
+          .select([
+            "company.id",
+            "company.uuid",
+            "company.code",
+            "company.name",
+            "company.type as typeId",
+            "companyType.lookupCode as typeCode",
+            "companyType.lookupValue as typeName",
+            "company.isActive",
+            "company.taxNumber",
+            "company.email",
+            "company.phone",
+            "company.address",
+            "company.city",
+            "company.province",
+            "company.postalCode",
+            "company.createdAt",
+            "company.updatedAt",
+          ])
+          .whereNull("company.deletedAt");
 
-      if (search) {
-        const normalizedSearch = `%${String(search).trim()}%`;
+        if (search) {
+          const normalizedSearch = `%${String(search).trim()}%`;
 
-        query.andWhere((builder) => {
-          builder
-            .where("company.code", "like", normalizedSearch)
-            .orWhere("company.name", "like", normalizedSearch)
-            .orWhere("company.taxNumber", "like", normalizedSearch)
-            .orWhere("company.email", "like", normalizedSearch)
-            .orWhere("company.phone", "like", normalizedSearch)
-            .orWhere("company.city", "like", normalizedSearch)
-            .orWhere("company.province", "like", normalizedSearch);
-        });
+          query.andWhere((builder) => {
+            builder
+              .where("company.code", "like", normalizedSearch)
+              .orWhere("company.name", "like", normalizedSearch)
+              .orWhere("company.taxNumber", "like", normalizedSearch)
+              .orWhere("company.email", "like", normalizedSearch)
+              .orWhere("company.phone", "like", normalizedSearch)
+              .orWhere("company.city", "like", normalizedSearch)
+              .orWhere("company.province", "like", normalizedSearch);
+          });
+        }
+
+        if (type) {
+          query.andWhere(
+            "companyType.lookupCode",
+            String(type).trim().toUpperCase(),
+          );
+        }
+
+        if (isActive !== undefined) {
+          query.andWhere("company.isActive", parseBooleanQuery(isActive));
+        }
+
+        const companies = await query.orderBy("company.name", "asc");
+
+        return res.success(companies);
+      } catch (error) {
+        console.error("GET /company error:", error);
+
+        return res.fail(error.message || "Failed to load companies.");
       }
-
-      if (type) {
-        query.andWhere(
-          "companyType.lookupCode",
-          String(type).trim().toUpperCase(),
-        );
-      }
-
-      if (isActive !== undefined) {
-        query.andWhere("company.isActive", parseBooleanQuery(isActive));
-      }
-
-      const companies = await query.orderBy("company.name", "asc");
-
-      return res.success(companies);
-    } catch (error) {
-      console.error("GET /company error:", error);
-
-      return res.fail(error.message || "Failed to load companies.");
-    }
-  })
+    },
+  )
 
   /**
    * GET /company/:uuid
    */
-  .get("/:uuid", async (req, res) => {
+  .get("/:uuid", authorization("COMPANY.VIEW"), async (req, res) => {
     try {
       const company = await findCompanyByUuid(req.params.uuid);
 
@@ -129,7 +144,7 @@ router
   /**
    * POST /company
    */
-  .post("/", async (req, res) => {
+  .post("/", authorization("COMPANY.CREATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -241,7 +256,7 @@ router
   /**
    * PUT /company/:uuid
    */
-  .put("/:uuid", async (req, res) => {
+  .put("/:uuid", authorization("COMPANY.UPDATE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
@@ -370,7 +385,7 @@ router
    *
    * Soft delete.
    */
-  .delete("/:uuid", async (req, res) => {
+  .delete("/:uuid", authorization("COMPANY.DELETE"), async (req, res) => {
     const trx = await db.transaction();
 
     try {
