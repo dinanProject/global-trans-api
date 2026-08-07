@@ -8,4 +8,6 @@ deployment:
     - /bin/cp package-lock.json /DATA/u3868672/global-trans-api/package-lock.json
     - /bin/rm -rf /DATA/u3868672/global-trans-api/src
     - /bin/cp -R src /DATA/u3868672/global-trans-api/src
+    - /bin/rm -rf /DATA/u3868672/global-trans-api/public
+    - /bin/cp -R public /DATA/u3868672/global-trans-api/public
     - /bin/touch /DATA/u3868672/global-trans-api/tmp/restart.txt
