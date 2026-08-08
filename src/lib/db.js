@@ -58,6 +58,18 @@ module.exports = function (database = "default") {
 
   // TEMP PERFORMANCE INSTRUMENTATION
 
+  const fs = require("fs");
+  const path = require("path");
+
+  const performanceLogFile = path.join(__dirname, "../../performance.log");
+
+  function writePerformanceLog(message) {
+    fs.appendFileSync(
+      performanceLogFile,
+      `${new Date().toISOString()} ${message}\n`,
+    );
+  }
+
   const queryStartedAt = new Map();
 
   db.on("query", (query) => {
@@ -81,7 +93,7 @@ module.exports = function (database = "default") {
       queryStartedAt.delete(queryId);
     }
 
-    console.log(`[DB END] ${queryId || "-"} ${duration ?? "?"} ms`);
+    writePerformanceLog(`[DB END] ${queryId || "-"} ${duration ?? "?"} ms`);
   });
 
   db.on("query-error", (error, query) => {

@@ -12,6 +12,16 @@ const routes = require("./src/routes/routes");
 const app = express();
 const port = Number(process.env.PORT || 3000);
 
+const fs = require("fs");
+
+const performanceLogFile = path.join(__dirname, "performance.log");
+
+function writePerformanceLog(message) {
+  fs.appendFileSync(
+    performanceLogFile,
+    `${new Date().toISOString()} ${message}\n`,
+  );
+}
 // TEMP PERFORMANCE INSTRUMENTATION
 
 app.use((req, res, next) => {
@@ -20,7 +30,7 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const duration = Date.now() - startedAt;
 
-    console.log(
+    writePerformanceLog(
       `[HTTP] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration} ms`,
     );
   });
