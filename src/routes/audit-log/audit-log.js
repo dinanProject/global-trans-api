@@ -1,10 +1,15 @@
 "use strict";
 const express = require("express");
 const router = express.Router();
-const authentication = require("../../lib/authentication");
-const authorization = require("../../lib/authorization");
+const {
+  authenticate: authentication,
+  authorize: authorization,
+} = require("../../modules/access/access.middleware");
+
 const db = require("../../lib/db")();
+
 router.use(authentication);
+
 router.get("/", authorization("AUDIT_LOG.VIEW"), async (req, res) => {
   try {
     const page = Math.max(Number(req.query.page || 1), 1);

@@ -4,7 +4,9 @@ const crypto = require("node:crypto");
 const express = require("express");
 
 const db = require("../../lib/db")();
-const authentication = require("../../lib/authentication");
+const {
+  authenticate: authentication,
+} = require("../../modules/access/access.middleware");
 
 const router = express.Router();
 

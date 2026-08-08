@@ -5,7 +5,10 @@ const { randomUUID } = require("crypto");
 
 const router = express.Router();
 
-const authentication = require("../../lib/authentication");
+const {
+  authenticate: authentication,
+} = require("../../modules/access/access.middleware");
+
 const db = require("../../lib/db")();
 
 router.use(authentication);

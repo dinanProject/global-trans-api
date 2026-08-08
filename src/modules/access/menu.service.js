@@ -1,7 +1,6 @@
 "use strict";
 
 const db = require("../../lib/db")();
-const { getUserAccess } = require("../../lib/user-access");
 
 function buildMenuTree(rows) {
   const menuMap = new Map();
@@ -17,6 +16,7 @@ function buildMenuTree(rows) {
       route: row.route,
       icon: row.icon,
       permissionId: row.permissionId,
+      permissionCode: row.permissionCode,
       sequence: row.sequence,
       child: [],
     });
@@ -35,44 +35,41 @@ function buildMenuTree(rows) {
   return roots;
 }
 
-async function getUserSession(authUser) {
-  const userId = authUser?.userId ?? authUser?.id;
+function removeEmptyParents(menus) {
+  return menus
+    .map((menu) => ({
+      ...menu,
+      child: removeEmptyParents(menu.child || []),
+    }))
+    .filter((menu) => Boolean(menu.route) || menu.child.length > 0);
+}
 
-  if (!userId) {
-    throw new Error("User ID tidak ditemukan");
+async function getMenusForAccess(access, trx = db) {
+  if (!access) {
+    return [];
   }
 
-  const access = await getUserAccess(userId); // ambil access role
-
-  const permissionRows = await db("rolePermissions as rp")
-    .distinct("rp.permissionId")
-    .join("userRoles as ur", "ur.roleId", "rp.roleId")
-    .where("ur.userId", userId);
-
   const permissionIds = new Set(
-    permissionRows.map((item) => String(item.permissionId)),
+    (access.permissions || []).map((permission) => String(permission.id)),
   );
 
-  /*
-   * Ambil seluruh menu aktif terlebih dahulu.
-   * Setelah itu baru filter berdasarkan permission user
-   * dan sertakan parent dari menu yang diizinkan.
-   */
-  const allMenuRows = await db("menus")
+  const allMenuRows = await trx("menus as m")
+    .leftJoin("permissions as p", "p.permissionId", "m.permissionId")
     .select([
-      "menuId",
-      "uuid",
-      "parentId",
-      "code",
-      "menuName",
-      "route",
-      "icon",
-      "permissionId",
-      "sequence",
+      "m.menuId",
+      "m.uuid",
+      "m.parentId",
+      "m.code",
+      "m.menuName",
+      "m.route",
+      "m.icon",
+      "m.permissionId",
+      "p.code as permissionCode",
+      "m.sequence",
     ])
-    .where("isActive", true)
-    .orderBy("sequence", "asc")
-    .orderBy("menuId", "asc");
+    .where("m.isActive", true)
+    .orderBy("m.sequence", "asc")
+    .orderBy("m.menuId", "asc");
 
   const menuById = new Map(
     allMenuRows.map((menu) => [String(menu.menuId), menu]),
@@ -105,13 +102,6 @@ async function getUserSession(authUser) {
       menu.permissionId !== null &&
       permissionIds.has(String(menu.permissionId));
 
-    /*
-     * Menu root tanpa permission yang mempunyai route dianggap public,
-     * misalnya Dashboard.
-     *
-     * Parent/container tanpa permission seperti Organization dan
-     * Administration tidak otomatis ditampilkan.
-     */
     const isPublicRootMenu =
       menu.permissionId === null && !menu.parentId && Boolean(menu.route);
 
@@ -124,15 +114,9 @@ async function getUserSession(authUser) {
     allowedMenuIds.has(String(menu.menuId)),
   );
 
-  const menus = buildMenuTree(menuRows);
-  return {
-    user: access.user,
-    menus,
-    roleCodes: access.roleCodes,
-    permissionCodes: access.permissionCodes,
-  };
+  return removeEmptyParents(buildMenuTree(menuRows));
 }
 
 module.exports = {
-  getUserSession,
+  getMenusForAccess,
 };

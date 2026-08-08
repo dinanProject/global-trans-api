@@ -1,8 +1,8 @@
 "use strict";
 
-const db = require("./db")();
+const db = require("../../lib/db")();
 
-async function getUserAccess(userId, trx = db) {
+async function getAccessContext(userId, trx = db) {
   const user = await trx("users as u")
     .leftJoin("companies as c", function () {
       this.on("c.id", "=", "u.companyId").andOnNull("c.deletedAt");
@@ -41,41 +41,43 @@ async function getUserAccess(userId, trx = db) {
     return null;
   }
 
-  const roles = await trx("userRoles as ur")
-    .join("roles as r", "r.id", "ur.roleId")
-    .select([
-      "r.id",
-      "r.uuid",
-      "r.code",
-      "r.name",
-      "r.description",
-      "r.isSystem",
-      "r.isActive",
-    ])
-    .where("ur.userId", user.id)
-    .where("r.isActive", true)
-    .distinct()
-    .orderBy("r.name", "asc");
+  const [roles, permissions] = await Promise.all([
+    trx("userRoles as ur")
+      .join("roles as r", "r.id", "ur.roleId")
+      .select([
+        "r.id",
+        "r.uuid",
+        "r.code",
+        "r.name",
+        "r.description",
+        "r.isSystem",
+        "r.isActive",
+      ])
+      .where("ur.userId", user.id)
+      .where("r.isActive", true)
+      .distinct()
+      .orderBy("r.name", "asc"),
 
-  const permissions = await trx("userRoles as ur")
-    .join("roles as r", "r.id", "ur.roleId")
-    .join("rolePermissions as rp", "rp.roleId", "r.id")
-    .join("permissions as p", "p.permissionId", "rp.permissionId")
-    .select([
-      "p.permissionId as id",
-      "p.uuid",
-      "p.code",
-      "p.scope",
-      "p.label",
-      "p.module",
-      "p.action",
-      "p.description",
-    ])
-    .where("ur.userId", user.id)
-    .where("r.isActive", true)
-    .where("p.isActive", true)
-    .distinct()
-    .orderBy("p.code", "asc");
+    trx("userRoles as ur")
+      .join("roles as r", "r.id", "ur.roleId")
+      .join("rolePermissions as rp", "rp.roleId", "r.id")
+      .join("permissions as p", "p.permissionId", "rp.permissionId")
+      .select([
+        "p.permissionId as id",
+        "p.uuid",
+        "p.code",
+        "p.scope",
+        "p.label",
+        "p.module",
+        "p.action",
+        "p.description",
+      ])
+      .where("ur.userId", user.id)
+      .where("r.isActive", true)
+      .where("p.isActive", true)
+      .distinct()
+      .orderBy("p.code", "asc"),
+  ]);
 
   return {
     user: {
@@ -124,23 +126,10 @@ async function getUserAccess(userId, trx = db) {
     permissions,
 
     roleCodes: roles.map((role) => role.code),
-
     permissionCodes: permissions.map((permission) => permission.code),
   };
-
-  const databaseResult = await trx.raw("SELECT DATABASE() AS databaseName");
-
-  const databaseRows = Array.isArray(databaseResult)
-    ? databaseResult[0]
-    : databaseResult;
-
-  console.log("GET USER ACCESS RESULT:", {
-    userId: user.id,
-    roles,
-    permissionCount: permissions.length,
-  });
 }
 
 module.exports = {
-  getUserAccess,
+  getAccessContext,
 };

@@ -8,7 +8,6 @@ const path = require("path");
 const request = require("./src/lib/request");
 const response = require("./src/lib/response");
 const routes = require("./src/routes/routes");
-const userSessionRoutes = require("./src/modules/user-session/user-session.routes");
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -28,7 +27,6 @@ app.use(
 
 app.use("/public", express.static(path.join(__dirname, "public")));
 
-app.use("/user-session", userSessionRoutes);
 app.use("/api/v1", routes);
 
 app.use(function (req, res) {

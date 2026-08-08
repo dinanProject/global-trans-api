@@ -25,6 +25,14 @@ module.exports = function (req, res, next) {
     req._user = user;
   };
 
+  req.getAccess = function () {
+    return req._access || null;
+  };
+
+  req.setAccess = function (access) {
+    req._access = access;
+  };
+
   req.getData = function () {
     return req._data || null;
   };

@@ -5,8 +5,10 @@ const express = require("express");
 const route = express.Router();
 
 const db = require("../../lib/db")();
-const authentication = require("../../lib/authentication");
-const authorize = require("../../lib/authorization");
+const {
+  authenticate: authentication,
+  authorize,
+} = require("../../modules/access/access.middleware");
 
 route.get(
   "/",

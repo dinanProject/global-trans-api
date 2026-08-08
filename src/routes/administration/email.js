@@ -4,8 +4,11 @@ const express = require("express");
 
 const router = express.Router();
 
-const authentication = require("../../lib/authentication");
-const authorization = require("../../lib/authorization");
+const {
+  authenticate: authentication,
+  authorize: authorization,
+} = require("../../modules/access/access.middleware");
+
 const db = require("../../lib/db")();
 
 router.use(authentication);

@@ -4,23 +4,15 @@ const crypto = require("node:crypto");
 const express = require("express");
 
 const db = require("../../lib/db")();
-const authentication = require("../../lib/authentication");
-const authorization = require("../../lib/authorization");
+const {
+  authenticate: authentication,
+  authorize: authorization,
+} = require("../../modules/access/access.middleware");
+
 const router = express.Router();
 
 router.use(authentication);
 
-/**
- * Beberapa database lama mungkin menggunakan:
- *
- * permissions.id
- *
- * sedangkan database lain mungkin menggunakan:
- *
- * permissions.permissionId
- *
- * Fungsi ini mendeteksi primary key yang tersedia agar query tetap berjalan.
- */
 let cachedPermissionPrimaryKey = null;
 
 async function getPermissionPrimaryKey() {

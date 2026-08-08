@@ -1,22 +1,75 @@
 "use strict";
 
-const db = require("./db")();
+const jwt = require("../../lib/jwt");
+const { getAccessContext } = require("./access.service");
 
-const { getUserAccess } = require("./user-access");
 const HOLDER_COMPANY_TYPE = 1;
 
-/**
- * Normalize permission input.
- *
- * Supported:
- *
- * authorization("USER.UPDATE")
- *
- * authorization([
- *   "USER.UPDATE",
- *   "USER.ROLE.ASSIGN",
- * ])
- */
+async function authenticate(req, res, next) {
+  try {
+    const authorization = req.headers.authorization;
+
+    if (!authorization?.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Access token tidak ditemukan",
+      });
+    }
+
+    const token = authorization.slice(7).trim();
+    const payload = jwt.verifyAccessToken(token);
+
+    const userId = payload?.userId ?? payload?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Payload token tidak valid",
+        code: "INVALID_TOKEN_PAYLOAD",
+      });
+    }
+
+    const access = await getAccessContext(userId);
+
+    if (!access) {
+      return res.status(401).json({
+        success: false,
+        message: "User tidak aktif atau tidak ditemukan",
+        code: "USER_NOT_AVAILABLE",
+      });
+    }
+
+    req.setUser(payload);
+    req.setAccess(access);
+
+    // Compatibility sementara.
+    const existingData = req.getData() || {};
+
+    req.setData({
+      ...existingData,
+      access,
+    });
+
+    return next();
+  } catch (error) {
+    if (error.name === "TokenExpiredError") {
+      return res.status(401).json({
+        success: false,
+        message: "Access token sudah kedaluwarsa",
+        code: "TOKEN_EXPIRED",
+      });
+    }
+
+    console.error("Authentication error:", error);
+
+    return res.status(401).json({
+      success: false,
+      message: "Access token tidak valid",
+      code: "INVALID_TOKEN",
+    });
+  }
+}
+
 function normalizePermissions(permissions) {
   if (!permissions) {
     return [];
@@ -40,7 +93,7 @@ function normalizePermissions(permissions) {
   return [];
 }
 
-function authorization(
+function authorize(
   permissions,
   {
     requireAll = true,
@@ -51,23 +104,12 @@ function authorization(
 ) {
   const requiredPermissions = normalizePermissions(permissions);
 
-  return async function authorize(req, res, next) {
+  return function authorizeRequest(req, res, next) {
     try {
-      const authenticatedUser = req.getUser();
-
-      const authenticatedUserId =
-        authenticatedUser?.userId ?? authenticatedUser?.id;
-
-      if (!authenticatedUserId) {
-        return res.unauthenticated(
-          "Authenticated user information was not found.",
-        );
-      }
-
-      const access = await getUserAccess(authenticatedUserId);
+      const access = req.getAccess();
 
       if (!access) {
-        return res.unauthenticated("User is inactive or no longer available.");
+        return res.unauthenticated("User access information was not found.");
       }
 
       if (access.company && access.company.isActive === false) {
@@ -112,20 +154,14 @@ function authorization(
         }
       }
 
-      const existingData = req.getData() || {};
-
-      req.setData({
-        ...existingData,
-        access,
-      });
-
       return next();
-    } catch (err) {
-      return next(err);
+    } catch (error) {
+      return next(error);
     }
   };
 }
 
-authorization.getUserAccess = getUserAccess;
-
-module.exports = authorization;
+module.exports = {
+  authenticate,
+  authorize,
+};

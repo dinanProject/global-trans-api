@@ -4,9 +4,11 @@ const express = require("express");
 const { randomUUID } = require("crypto");
 
 const router = express.Router();
+const {
+  authenticate: authentication,
+  authorize: authorization,
+} = require("../../modules/access/access.middleware");
 const db = require("../../lib/db")();
-const authentication = require("../../lib/authentication");
-const authorization = require("../../lib/authorization");
 
 const {
   enqueueAssignmentNotifications,
