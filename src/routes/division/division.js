@@ -60,6 +60,10 @@ router
           .whereNull("division.deletedAt")
           .whereNull("company.deletedAt");
 
+        if (filters.companyId) {
+          query.where("division.companyId", filters.companyId);
+        }
+
         if (filters.companyUuid) {
           query.where("company.uuid", filters.companyUuid);
         }
@@ -456,6 +460,7 @@ function normalizePayload(body = {}) {
 function normalizeListFilters(query = {}) {
   return {
     search: normalizeNullableString(query.search),
+    companyId: normalizeNullablePositiveInteger(query.companyId),
     companyUuid: normalizeNullableString(query.companyUuid),
     isActive: normalizeNullableBoolean(query.isActive),
   };
@@ -493,6 +498,20 @@ function normalizeNullableString(value) {
   const normalizedValue = value.trim();
 
   return normalizedValue || null;
+}
+
+function normalizeNullablePositiveInteger(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+
+  return parsed;
 }
 
 function normalizeNullableBoolean(value) {
