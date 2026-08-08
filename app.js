@@ -12,6 +12,24 @@ const routes = require("./src/routes/routes");
 const app = express();
 const port = Number(process.env.PORT || 3000);
 
+// TEMP PERFORMANCE INSTRUMENTATION
+
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+
+  res.on("finish", () => {
+    const duration = Date.now() - startedAt;
+
+    console.log(
+      `[HTTP] ${req.method} ${req.originalUrl} ${res.statusCode} ${duration} ms`,
+    );
+  });
+
+  next();
+});
+
+app.enable("trust proxy");
+
 app.enable("trust proxy");
 
 app.use(request);
