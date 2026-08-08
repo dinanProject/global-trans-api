@@ -356,6 +356,9 @@ async function enqueueOperationCompletedNotifications(
   const completionDetailsText =
     buildOperationCompletedDetailsText(completedAssignments);
 
+  const completionDetailsHtml =
+    buildOperationCompletedDetailsHtml(completedAssignments);
+
   const payload = enrichPayload({
     recipientName: requester.fullName || "User",
     recipientEmail: requester.email,
@@ -390,10 +393,7 @@ async function enqueueOperationCompletedNotifications(
     overallSlaStatus: getOverallCompletionSlaStatus(completedAssignments),
 
     completionDetailsText,
-    completionDetailsHtml: escapeHtml(completionDetailsText).replace(
-      /\n/g,
-      "<br>",
-    ),
+    completionDetailsHtml,
 
     requestUrl: buildFrontendUrl("/main/equipment-request/assignments"),
   });
@@ -799,6 +799,62 @@ function getStartSlaStatus(assignment) {
   const actualStartDate = formatDateOnly(assignment.actualStartDate);
   const plannedStartDate = formatDateOnly(assignment.plannedStartDate);
   return actualStartDate <= plannedStartDate ? "On Time Start" : "Late Start";
+}
+
+function buildOperationCompletedDetailsHtml(assignments) {
+  if (!assignments.length) {
+    return "-";
+  }
+
+  return assignments
+    .map((assignment, index) => {
+      const equipmentName =
+        assignment.unitName || assignment.categoryName || "Equipment";
+
+      const equipmentCode =
+        assignment.unitCode || assignment.categoryCode || "-";
+
+      const assetNumber = assignment.assetNumber || "-";
+      const slaStatus = getCompletionSlaStatus(assignment);
+
+      return `
+        <div style="margin-bottom:12px;padding:14px 16px;border:1px solid #e2e8f0;border-radius:8px;background:#ffffff;">
+          <div style="margin-bottom:10px;font-size:13px;font-weight:700;color:#334155;">
+            ${index + 1}. ${escapeHtml(equipmentCode)} - ${escapeHtml(equipmentName)}
+          </div>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;line-height:1.6;color:#475569;">
+            <tr>
+              <td style="width:120px;padding:2px 0;color:#64748b;">Asset</td>
+              <td style="padding:2px 0;font-weight:600;color:#334155;">${escapeHtml(assetNumber)}</td>
+            </tr>
+            <tr>
+              <td style="padding:2px 0;color:#64748b;">Planned Start</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateOnly(assignment.plannedStartDate))}</td>
+            </tr>
+            <tr>
+              <td style="padding:2px 0;color:#64748b;">Actual Start</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateTime(assignment.actualStartDate))}</td>
+            </tr>
+            <tr>
+              <td style="padding:2px 0;color:#64748b;">Planned End</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateOnly(assignment.plannedEndDate))}</td>
+            </tr>
+            <tr>
+              <td style="padding:2px 0;color:#64748b;">Actual End</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateTime(assignment.actualEndDate))}</td>
+            </tr>
+            <tr>
+              <td style="padding:2px 0;color:#64748b;">SLA Status</td>
+              <td style="padding:2px 0;font-weight:700;color:${slaStatus === "Completed On Time" ? "#4f8a68" : "#b7791f"};">
+                ${escapeHtml(slaStatus)}
+              </td>
+            </tr>
+          </table>
+        </div>
+      `;
+    })
+    .join("");
 }
 
 function getCompletionSlaStatus(assignment) {
