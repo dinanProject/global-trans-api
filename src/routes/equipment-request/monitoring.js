@@ -1249,6 +1249,10 @@ const MONITORING_ASSIGNMENT_STATUS_CODES = [
   "COMPLETED",
 ];
 
+const MONITORING_TIME_ZONE = (
+  process.env.APP_TIMEZONE || "Asia/Jakarta"
+).replace(/^["']|["']$/g, "");
+
 function normalizeDateOnly(value) {
   if (!value) {
     return null;
@@ -1260,11 +1264,21 @@ function normalizeDateOnly(value) {
     return null;
   }
 
-  return date.toISOString().slice(0, 10);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: MONITORING_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  return year && month && day ? `${year}-${month}-${day}` : null;
 }
 
 function getTodayDate() {
-  return new Date().toISOString().slice(0, 10);
+  return normalizeDateOnly(new Date());
 }
 
 function calculateRemainingDays(plannedEndDate, actualEndDate = null) {
