@@ -99,7 +99,11 @@ async function getUserMenus(userId, trx = db) {
     .orderBy("m.sequence", "asc");
 
   menusQuery.andWhere(function () {
-    this.whereNull("m.permissionId");
+    this.where(function () {
+      this.whereNull("m.permissionId")
+        .whereNull("m.parentId")
+        .whereNotNull("m.route");
+    });
 
     if (permissionIds.length > 0) {
       this.orWhereIn("m.permissionId", permissionIds);

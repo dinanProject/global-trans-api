@@ -280,6 +280,15 @@ router
         return res.incomplete(validation.message);
       }
 
+      if (
+        payload.code !==
+        normalizeRequiredString(existingCompany.code).toUpperCase()
+      ) {
+        await trx.rollback();
+
+        return res.incomplete("Company code cannot be changed after creation.");
+      }
+
       const companyType = await trx("sysLookups")
         .where("lookupId", payload.typeId)
         .where("lookupGroup", "company_type")
@@ -291,20 +300,6 @@ router
         await trx.rollback();
 
         return res.incomplete("Company type tidak valid.");
-      }
-
-      const duplicateCode = await trx("companies")
-        .whereRaw("UPPER(code) = ?", [payload.code])
-        .whereNot("id", existingCompany.id)
-        .whereNull("deletedAt")
-        .first("id");
-
-      if (duplicateCode) {
-        await trx.rollback();
-
-        return res.incomplete(
-          `Company code "${payload.code}" sudah digunakan.`,
-        );
       }
 
       const duplicateName = await trx("companies")
@@ -352,7 +347,6 @@ router
       }
 
       await trx("companies").where("id", existingCompany.id).update({
-        code: payload.code,
         name: payload.name,
         type: payload.typeId,
         isActive: payload.isActive,
