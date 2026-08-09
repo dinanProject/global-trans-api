@@ -40,8 +40,6 @@ app.use((req, res, next) => {
 
 app.enable("trust proxy");
 
-app.enable("trust proxy");
-
 app.use(request);
 app.use(response);
 
@@ -54,6 +52,10 @@ app.use(
 );
 
 app.use("/public", express.static(path.join(__dirname, "public")));
+
+app.get("/health-perf", (req, res) => {
+  res.json({ ok: true });
+});
 
 app.use("/api/v1", routes);
 
