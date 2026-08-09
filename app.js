@@ -53,6 +53,11 @@ app.use(
 
 app.use("/public", express.static(path.join(__dirname, "public")));
 
+app.get("/health-perf/:id", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true, id: req.params.id });
+});
+
 app.get("/health-perf", (req, res) => {
   res.json({ ok: true });
 });
