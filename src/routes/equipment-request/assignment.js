@@ -2,6 +2,8 @@
 
 const express = require("express");
 const { randomUUID } = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const router = express.Router();
 const {
@@ -9,6 +11,15 @@ const {
   authorize: authorization,
 } = require("../../modules/access/access.middleware");
 const db = require("../../lib/db")();
+
+const performanceLogFile = path.join(__dirname, "../../../performance.log");
+
+function writeStartAllPerformanceLog(message) {
+  fs.appendFileSync(
+    performanceLogFile,
+    `${new Date().toISOString()} ${message}\n`,
+  );
+}
 
 const {
   enqueueAssignmentNotifications,
@@ -1613,9 +1624,12 @@ router.post(
 
     try {
       const perfStart = Date.now();
+      const perfMarks = [];
+
       const perf = (label) => {
-        console.log(`[PERF start-all] ${label}: ${Date.now() - perfStart} ms`);
+        perfMarks.push(`${label}=${Date.now() - perfStart}`);
       };
+
       const access = await getRequestAccess(req);
 
       perf("getRequestAccess");
@@ -1726,7 +1740,9 @@ router.post(
 
       const updatedAssignments = await findAssignments(equipmentRequest.id);
       perf("findAssignments response");
-
+      writeStartAllPerformanceLog(
+        `[PERF start-all] ${perfMarks.join(" ")} total=${Date.now() - perfStart} ms`,
+      );
       return res.success(updatedAssignments);
     } catch (error) {
       await trx.rollback();
