@@ -1612,7 +1612,13 @@ router.post(
     const trx = await db.transaction();
 
     try {
+      const perfStart = Date.now();
+      const perf = (label) => {
+        console.log(`[PERF start-all] ${label}: ${Date.now() - perfStart} ms`);
+      };
       const access = await getRequestAccess(req);
+
+      perf("getRequestAccess");
 
       const equipmentRequest = await findRequestForUpdate(
         trx,
@@ -1625,6 +1631,8 @@ router.post(
 
         return res.incomplete("Equipment request tidak ditemukan.");
       }
+
+      perf("findRequestForUpdate");
 
       const assignmentUuids = Array.isArray(req.body?.assignmentUuids)
         ? [...new Set(req.body.assignmentUuids.filter(Boolean))]
@@ -1654,6 +1662,8 @@ router.post(
         );
       }
 
+      perf("load assignments for update");
+
       const invalidAssignment = assignments.find(
         (assignment) => assignment.statusCode !== ASSIGNMENT_STATUS_ASSIGNED,
       );
@@ -1675,6 +1685,8 @@ router.post(
         updatedAt: now,
       });
 
+      perf("update assignments");
+
       await trx("equipmentRequestHistories").insert(
         assignments.map((assignment) => ({
           uuid: randomUUID(),
@@ -1686,10 +1698,14 @@ router.post(
         })),
       );
 
+      perf("insert histories");
+
       const operationalStatusResult = await synchronizeRequestOperationalStatus(
         trx,
         equipmentRequest.id,
       );
+
+      perf("synchronize operational status");
 
       if (
         operationalStatusResult.statusChanged &&
@@ -1702,9 +1718,14 @@ router.post(
         });
       }
 
+      perf("enqueue notifications");
+
       await trx.commit();
 
+      perf("commit");
+
       const updatedAssignments = await findAssignments(equipmentRequest.id);
+      perf("findAssignments response");
 
       return res.success(updatedAssignments);
     } catch (error) {
