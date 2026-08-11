@@ -2,8 +2,6 @@
 
 const express = require("express");
 const { randomUUID } = require("crypto");
-const fs = require("fs");
-const path = require("path");
 
 const router = express.Router();
 const {
@@ -11,15 +9,6 @@ const {
   authorize: authorization,
 } = require("../../modules/access/access.middleware");
 const db = require("../../lib/db")();
-
-const performanceLogFile = path.join(__dirname, "../../../performance.log");
-
-function writeStartAllPerformanceLog(message) {
-  fs.appendFileSync(
-    performanceLogFile,
-    `${new Date().toISOString()} ${message}\n`,
-  );
-}
 
 const {
   enqueueAssignmentNotifications,
@@ -1623,16 +1612,7 @@ router.post(
     const trx = await db.transaction();
 
     try {
-      const perfStart = Date.now();
-      const perfMarks = [];
-
-      const perf = (label) => {
-        perfMarks.push(`${label}=${Date.now() - perfStart}`);
-      };
-
       const access = await getRequestAccess(req);
-
-      perf("getRequestAccess");
 
       const equipmentRequest = await findRequestForUpdate(
         trx,
@@ -1645,8 +1625,6 @@ router.post(
 
         return res.incomplete("Equipment request tidak ditemukan.");
       }
-
-      perf("findRequestForUpdate");
 
       const assignmentUuids = Array.isArray(req.body?.assignmentUuids)
         ? [...new Set(req.body.assignmentUuids.filter(Boolean))]
@@ -1676,8 +1654,6 @@ router.post(
         );
       }
 
-      perf("load assignments for update");
-
       const invalidAssignment = assignments.find(
         (assignment) => assignment.statusCode !== ASSIGNMENT_STATUS_ASSIGNED,
       );
@@ -1699,8 +1675,6 @@ router.post(
         updatedAt: now,
       });
 
-      perf("update assignments");
-
       await trx("equipmentRequestHistories").insert(
         assignments.map((assignment) => ({
           uuid: randomUUID(),
@@ -1712,14 +1686,10 @@ router.post(
         })),
       );
 
-      perf("insert histories");
-
       const operationalStatusResult = await synchronizeRequestOperationalStatus(
         trx,
         equipmentRequest.id,
       );
-
-      perf("synchronize operational status");
 
       if (
         operationalStatusResult.statusChanged &&
@@ -1732,17 +1702,10 @@ router.post(
         });
       }
 
-      perf("enqueue notifications");
-
       await trx.commit();
 
-      perf("commit");
-
       const updatedAssignments = await findAssignments(equipmentRequest.id);
-      perf("findAssignments response");
-      writeStartAllPerformanceLog(
-        `[PERF start-all] ${perfMarks.join(" ")} total=${Date.now() - perfStart} ms`,
-      );
+
       return res.success(updatedAssignments);
     } catch (error) {
       await trx.rollback();
