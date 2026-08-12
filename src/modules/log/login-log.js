@@ -1,33 +1,33 @@
-"use strict";
+'use strict';
 
-const crypto = require("crypto");
+const crypto = require('crypto');
 
-const db = require("../../lib/db")();
+const db = require('../../lib/db')();
 
-const LOGIN_STATUS_GROUP = "LOGIN_STATUS";
+const LOGIN_STATUS_GROUP = 'LOGIN_STATUS';
 
 const LOGIN_STATUS = Object.freeze({
-  SUCCESS: "SUCCESS",
-  FAILED: "FAILED",
+  SUCCESS: 'SUCCESS',
+  FAILED: 'FAILED',
 });
 
 const LOGIN_FAILURE_REASON = Object.freeze({
-  MISSING_CREDENTIALS: "MISSING_CREDENTIALS",
+  MISSING_CREDENTIALS: 'MISSING_CREDENTIALS',
 
-  INVALID_CREDENTIALS: "INVALID_CREDENTIALS",
-  INVALID_PASSWORD: "INVALID_PASSWORD",
+  INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
+  INVALID_PASSWORD: 'INVALID_PASSWORD',
 
-  USER_NOT_FOUND: "USER_NOT_FOUND",
-  USER_INACTIVE: "USER_INACTIVE",
+  USER_NOT_FOUND: 'USER_NOT_FOUND',
+  USER_INACTIVE: 'USER_INACTIVE',
 
-  ACCESS_LOAD_FAILED: "ACCESS_LOAD_FAILED",
-  SESSION_CREATION_FAILED: "SESSION_CREATION_FAILED",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
+  ACCESS_LOAD_FAILED: 'ACCESS_LOAD_FAILED',
+  SESSION_CREATION_FAILED: 'SESSION_CREATION_FAILED',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
 });
 const statusIdCache = new Map();
 
 function normalizeText(value, maximumLength) {
-  if (typeof value !== "string") {
+  if (typeof value !== 'string') {
     return null;
   }
 
@@ -41,7 +41,7 @@ function normalizeText(value, maximumLength) {
 }
 
 function normalizeEmail(email) {
-  if (typeof email !== "string") {
+  if (typeof email !== 'string') {
     return null;
   }
 
@@ -57,20 +57,18 @@ async function getLoginStatusId(statusCode, siteId = 1) {
     return statusIdCache.get(cacheKey);
   }
 
-  const lookup = await db("sysLookups")
+  const lookup = await db('sysLookups')
     .where({
       lookupGroup: LOGIN_STATUS_GROUP,
       lookupCode: statusCode,
       siteId,
       isActive: 1,
     })
-    .whereNull("deletedAt")
-    .first("lookupId");
+    .whereNull('deletedAt')
+    .first('lookupId');
 
   if (!lookup) {
-    throw new Error(
-      `Lookup ${LOGIN_STATUS_GROUP}/${statusCode} tidak ditemukan.`,
-    );
+    throw new Error(`Lookup ${LOGIN_STATUS_GROUP}/${statusCode} tidak ditemukan.`);
   }
 
   statusIdCache.set(cacheKey, lookup.lookupId);
@@ -90,7 +88,7 @@ async function createLoginLog({
 }) {
   const loginStatusId = await getLoginStatusId(statusCode, siteId);
 
-  await db("userLoginLogs").insert({
+  await db('userLoginLogs').insert({
     uuid: crypto.randomUUID(),
     userId: userId ?? null,
     email: normalizeEmail(email),
@@ -107,7 +105,7 @@ async function createLoginLogSafely(payload) {
   try {
     await createLoginLog(payload);
   } catch (error) {
-    console.error("[LOGIN LOG] Gagal menyimpan audit login:", error);
+    console.error('[LOGIN LOG] Gagal menyimpan audit login:', error);
   }
 }
 
