@@ -1,0 +1,187 @@
+"use strict";
+
+const { randomUUID } = require("crypto");
+
+async function resolveMenuCode(trx, { menuCode, menuPermissionCode } = {}) {
+  if (menuCode) {
+    return menuCode;
+  }
+
+  if (!menuPermissionCode) {
+    return null;
+  }
+
+  const menu = await trx("menus as m")
+    .join("permissions as p", "p.permissionId", "m.permissionId")
+    .where("p.code", menuPermissionCode)
+    .where("m.isActive", true)
+    .orderBy("m.sequence", "asc")
+    .orderBy("m.menuId", "asc")
+    .first("m.code");
+
+  return menu?.code ?? null;
+}
+
+async function createMenuNotifications(trx, notifications = []) {
+  if (!Array.isArray(notifications) || notifications.length === 0) {
+    return;
+  }
+
+  const normalized = [];
+
+  for (const notification of notifications) {
+    if (!notification?.recipientUserId || !notification?.moduleCode) {
+      continue;
+    }
+
+    const menuCode = await resolveMenuCode(trx, notification);
+
+    if (!menuCode) {
+      continue;
+    }
+
+    normalized.push({
+      ...notification,
+      menuCode,
+    });
+  }
+
+  if (normalized.length === 0) {
+    return;
+  }
+
+  const now = trx.fn.now();
+
+  const rows = normalized.map((notification) => ({
+    uuid: randomUUID(),
+    recipientUserId: notification.recipientUserId,
+    moduleCode: notification.moduleCode,
+    menuCode: notification.menuCode,
+    referenceId: notification.referenceId ?? null,
+    referenceUuid: notification.referenceUuid ?? null,
+    contextCode: notification.contextCode ?? null,
+    isRead: false,
+    readAt: null,
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+    deletedAt: null,
+  }));
+
+  await trx("userMenuNotifications").insert(rows);
+}
+
+async function getUnreadMenuCounts(trx, recipientUserId) {
+  if (!recipientUserId) {
+    return new Map();
+  }
+
+  const rows = await trx("userMenuNotifications")
+    .select("menuCode")
+    .count({ unreadCount: "id" })
+    .where({
+      recipientUserId,
+      isRead: false,
+      isActive: true,
+    })
+    .whereNull("deletedAt")
+    .groupBy("menuCode");
+
+  return new Map(
+    rows.map((row) => [String(row.menuCode), Number(row.unreadCount) || 0]),
+  );
+}
+
+function applyUnreadCounts(menus, unreadCounts) {
+  return (menus || []).map((menu) => {
+    const child = applyUnreadCounts(menu.child || [], unreadCounts);
+
+    const ownUnreadCount = Number(unreadCounts.get(String(menu.code)) || 0);
+    const childUnreadCount = child.reduce(
+      (total, item) => total + Number(item.unreadCount || 0),
+      0,
+    );
+
+    return {
+      ...menu,
+      unreadCount: child.length > 0 ? childUnreadCount : ownUnreadCount,
+      child,
+    };
+  });
+}
+
+async function deactivateReferenceNotifications(
+  trx,
+  { referenceUuid, moduleCode, menuCode, menuPermissionCode } = {},
+) {
+  if (!referenceUuid) {
+    return 0;
+  }
+
+  const resolvedMenuCode = await resolveMenuCode(trx, {
+    menuCode,
+    menuPermissionCode,
+  });
+
+  if (!resolvedMenuCode) {
+    return 0;
+  }
+
+  const query = trx("userMenuNotifications")
+    .where({
+      menuCode: resolvedMenuCode,
+      referenceUuid,
+      isActive: true,
+    })
+    .whereNull("deletedAt");
+
+  if (moduleCode) {
+    query.where("moduleCode", moduleCode);
+  }
+
+  return query.update({
+    isActive: false,
+    updatedAt: trx.fn.now(),
+  });
+}
+
+async function markReferenceAsRead(
+  trx,
+  { recipientUserId, referenceUuid, menuCode, menuPermissionCode } = {},
+) {
+  if (!recipientUserId || !referenceUuid) {
+    return 0;
+  }
+
+  const resolvedMenuCode = await resolveMenuCode(trx, {
+    menuCode,
+    menuPermissionCode,
+  });
+
+  if (!resolvedMenuCode) {
+    return 0;
+  }
+
+  return trx("userMenuNotifications")
+    .where({
+      recipientUserId,
+      menuCode: resolvedMenuCode,
+      referenceUuid,
+      isRead: false,
+      isActive: true,
+    })
+    .whereNull("deletedAt")
+    .update({
+      isRead: true,
+      readAt: trx.fn.now(),
+      updatedAt: trx.fn.now(),
+    });
+}
+
+module.exports = {
+  createMenuNotifications,
+  getUnreadMenuCounts,
+  applyUnreadCounts,
+  deactivateReferenceNotifications,
+  markReferenceAsRead,
+};

@@ -1,6 +1,7 @@
-"use strict";
+'use strict';
 
-const db = require("../../lib/db")();
+const db = require('../../lib/db')();
+const { getUnreadMenuCounts, applyUnreadCounts } = require('../../services/menu-notification');
 
 function buildMenuTree(rows) {
   const menuMap = new Map();
@@ -50,30 +51,28 @@ async function getMenusForAccess(access, trx = db) {
   }
 
   const permissionIds = new Set(
-    (access.permissions || []).map((permission) => String(permission.id)),
+    (access.permissions || []).map((permission) => String(permission.id))
   );
 
-  const allMenuRows = await trx("menus as m")
-    .leftJoin("permissions as p", "p.permissionId", "m.permissionId")
+  const allMenuRows = await trx('menus as m')
+    .leftJoin('permissions as p', 'p.permissionId', 'm.permissionId')
     .select([
-      "m.menuId",
-      "m.uuid",
-      "m.parentId",
-      "m.code",
-      "m.menuName",
-      "m.route",
-      "m.icon",
-      "m.permissionId",
-      "p.code as permissionCode",
-      "m.sequence",
+      'm.menuId',
+      'm.uuid',
+      'm.parentId',
+      'm.code',
+      'm.menuName',
+      'm.route',
+      'm.icon',
+      'm.permissionId',
+      'p.code as permissionCode',
+      'm.sequence',
     ])
-    .where("m.isActive", true)
-    .orderBy("m.sequence", "asc")
-    .orderBy("m.menuId", "asc");
+    .where('m.isActive', true)
+    .orderBy('m.sequence', 'asc')
+    .orderBy('m.menuId', 'asc');
 
-  const menuById = new Map(
-    allMenuRows.map((menu) => [String(menu.menuId), menu]),
-  );
+  const menuById = new Map(allMenuRows.map((menu) => [String(menu.menuId), menu]));
 
   const allowedMenuIds = new Set();
 
@@ -99,22 +98,21 @@ async function getMenusForAccess(access, trx = db) {
 
   for (const menu of allMenuRows) {
     const hasPermission =
-      menu.permissionId !== null &&
-      permissionIds.has(String(menu.permissionId));
+      menu.permissionId !== null && permissionIds.has(String(menu.permissionId));
 
-    const isPublicRootMenu =
-      menu.permissionId === null && !menu.parentId && Boolean(menu.route);
+    const isPublicRootMenu = menu.permissionId === null && !menu.parentId && Boolean(menu.route);
 
     if (hasPermission || isPublicRootMenu) {
       addMenuAndParents(menu);
     }
   }
 
-  const menuRows = allMenuRows.filter((menu) =>
-    allowedMenuIds.has(String(menu.menuId)),
-  );
+  const menuRows = allMenuRows.filter((menu) => allowedMenuIds.has(String(menu.menuId)));
 
-  return removeEmptyParents(buildMenuTree(menuRows));
+  const menus = removeEmptyParents(buildMenuTree(menuRows));
+  const unreadCounts = await getUnreadMenuCounts(trx, access.user?.id);
+
+  return applyUnreadCounts(menus, unreadCounts);
 }
 
 module.exports = {

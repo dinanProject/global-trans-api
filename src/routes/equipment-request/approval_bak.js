@@ -13,286 +13,316 @@ const db = require("../../lib/db")();
 const {
   enqueueRequestActionNotifications,
 } = require("../../services/equipment-request/email");
-const {
-  enqueueRequestActionMenuNotifications,
-} = require("../../services/equipment-request/notification");
 
 const HOLDER_COMPANY_TYPE = 1;
-const STATUS_DRAFT = "DRAFT";
+
 const ACTION_SUBMIT = "SUBMIT";
-const SCHEDULE_REVIEW_ACTIONS = new Set(["APPROVE_CLIENT", "APPROVE_GTSI"]);
+const ACTION_APPROVE_CLIENT = "APPROVE_CLIENT";
+const ACTION_APPROVE_GTSI = "APPROVE_GTSI";
+const ACTION_REJECT_CLIENT = "REJECT_CLIENT";
+const ACTION_REJECT_GTSI = "REJECT_GTSI";
+
+const APPROVAL_STATUS_PENDING = "PENDING";
+const APPROVAL_STATUS_APPROVED = "APPROVED";
+const APPROVAL_STATUS_REJECTED = "REJECTED";
 
 router.use(authentication);
 
 /**
- * GET /equipment-request
+ * GET /equipment-request/approval
  *
- * Query:
- * - search
- * - status
- * - companyUuid
- * - divisionUuid
- * - startDate
- * - endDate
- * - isActive
+ * Worklist approval/review. Returns only requests that have approval-related availableActions.
  */
-router
-  .get("/", authorization("EQUIPMENT_REQUEST.VIEW"), async (req, res) => {
-    try {
-      const access = await getRequestAccess(req);
-      const {
-        search,
-        status,
-        companyUuid,
-        divisionUuid,
-        startDate,
-        endDate,
-        isActive,
-      } = req.query;
+router.get("/", authorization("EQUIPMENT_APPROVAL.VIEW"), async (req, res) => {
+  try {
+    const access = await getRequestAccess(req);
+    const {
+      search,
+      status,
+      companyUuid,
+      divisionUuid,
+      startDate,
+      endDate,
+      isActive,
+    } = req.query;
 
-      const query = db("equipmentRequests as request")
-        .leftJoin("companies as company", function () {
-          this.on("company.id", "=", "request.companyId").andOnNull(
-            "company.deletedAt",
-          );
-        })
-        .leftJoin("divisions as division", function () {
-          this.on("division.id", "=", "request.divisionId").andOnNull(
-            "division.deletedAt",
-          );
-        })
-        .leftJoin("users as requester", function () {
-          this.on("requester.id", "=", "request.requestBy").andOnNull(
-            "requester.deletedAt",
-          );
-        })
-        .leftJoin("equipmentRequestStatuses as requestStatus", function () {
-          this.on("requestStatus.code", "=", "request.status")
-            .andOnVal("requestStatus.isActive", "=", 1)
-            .andOnNull("requestStatus.deletedAt");
-        })
+    const query = db("equipmentRequests as request")
+      .leftJoin("companies as company", function () {
+        this.on("company.id", "=", "request.companyId").andOnNull(
+          "company.deletedAt",
+        );
+      })
+      .leftJoin("divisions as division", function () {
+        this.on("division.id", "=", "request.divisionId").andOnNull(
+          "division.deletedAt",
+        );
+      })
+      .leftJoin("users as requester", function () {
+        this.on("requester.id", "=", "request.requestBy").andOnNull(
+          "requester.deletedAt",
+        );
+      })
+      .leftJoin("equipmentRequestStatuses as requestStatus", function () {
+        this.on("requestStatus.code", "=", "request.status")
+          .andOnVal("requestStatus.isActive", "=", 1)
+          .andOnNull("requestStatus.deletedAt");
+      })
+      .select([
+        "request.id",
+        "request.uuid",
+        "request.requestNo",
+        "request.companyId",
+        "company.uuid as companyUuid",
+        "company.code as companyCode",
+        "company.name as companyName",
+        "request.divisionId",
+        "division.uuid as divisionUuid",
+        "division.code as divisionCode",
+        "division.name as divisionName",
+        "request.requestBy",
+        "requester.uuid as requestByUuid",
+        "requester.fullName as requestByName",
+        "request.requestDate",
+        "request.startDate",
+        "request.endDate",
+        "request.purpose",
+        "request.notes",
+        "request.status",
+        "requestStatus.name as statusName",
+        "requestStatus.stage as statusStage",
+        "requestStatus.sortOrder as statusSortOrder",
+        "requestStatus.allowEdit as statusAllowEdit",
+        "requestStatus.isTerminal as statusIsTerminal",
+        "request.currentApprovalLevel",
+        "request.approvalLocked",
+        "request.isActive",
+        "request.createdAt",
+        "request.updatedAt",
+      ])
+      .whereNull("request.deletedAt");
+
+    applyRequestScope(query, access, "request");
+
+    if (search) {
+      const normalizedSearch = `%${String(search).trim()}%`;
+      query.andWhere((builder) => {
+        builder
+          .where("request.requestNo", "like", normalizedSearch)
+          .orWhere("company.code", "like", normalizedSearch)
+          .orWhere("company.name", "like", normalizedSearch)
+          .orWhere("division.code", "like", normalizedSearch)
+          .orWhere("division.name", "like", normalizedSearch)
+          .orWhere("requester.fullName", "like", normalizedSearch)
+          .orWhere("request.purpose", "like", normalizedSearch)
+          .orWhere("request.notes", "like", normalizedSearch);
+      });
+    }
+
+    if (status) {
+      query.andWhere("request.status", String(status).trim().toUpperCase());
+    }
+
+    if (companyUuid) {
+      query.andWhere("company.uuid", String(companyUuid).trim());
+    }
+
+    if (divisionUuid) {
+      query.andWhere("division.uuid", String(divisionUuid).trim());
+    }
+
+    if (startDate) {
+      const normalizedStartDate = normalizeDate(startDate);
+      if (!normalizedStartDate)
+        return res.incomplete("Query startDate tidak valid.");
+      query.andWhere("request.endDate", ">=", normalizedStartDate);
+    }
+
+    if (endDate) {
+      const normalizedEndDate = normalizeDate(endDate);
+      if (!normalizedEndDate)
+        return res.incomplete("Query endDate tidak valid.");
+      query.andWhere("request.startDate", "<=", normalizedEndDate);
+    }
+
+    if (isActive !== undefined) {
+      query.andWhere("request.isActive", parseBooleanQuery(isActive));
+    }
+
+    const requests = await query.orderBy([
+      { column: "request.requestDate", order: "desc" },
+      { column: "request.id", order: "desc" },
+    ]);
+
+    const requestIds = requests.map((request) => request.id);
+
+    const equipmentSummaryByRequestId = new Map();
+
+    if (requestIds.length > 0) {
+      const detailSummaryQuery = db("equipmentRequestDetails")
+        .select("requestId")
+        .min({ previewDetailId: "id" })
+        .count({ detailCount: "id" })
+        .whereIn("requestId", requestIds)
+        .where("isActive", true)
+        .whereNull("deletedAt")
+        .groupBy("requestId")
+        .as("detailSummary");
+
+      const equipmentRows = await db
+        .from(detailSummaryQuery)
+        .leftJoin(
+          "equipmentRequestDetails as detail",
+          "detail.id",
+          "detailSummary.previewDetailId",
+        )
+        .leftJoin(
+          "equipmentUnits as equipmentUnit",
+          "equipmentUnit.id",
+          "detail.equipmentUnitId",
+        )
+        .leftJoin(
+          "equipmentCategories as equipmentCategory",
+          "equipmentCategory.id",
+          "detail.equipmentCategoryId",
+        )
         .select([
-          "request.id",
-          "request.uuid",
-          "request.requestNo",
-          "request.companyId",
-          "company.uuid as companyUuid",
-          "company.code as companyCode",
-          "company.name as companyName",
-          "request.divisionId",
-          "division.uuid as divisionUuid",
-          "division.code as divisionCode",
-          "division.name as divisionName",
-          "request.requestBy",
-          "requester.uuid as requestByUuid",
-          "requester.fullName as requestByName",
-          "request.requestDate",
-          "request.startDate",
-          "request.endDate",
-          "request.purpose",
-          "request.notes",
-          "request.status",
-          "requestStatus.name as statusName",
-          "requestStatus.stage as statusStage",
-          "requestStatus.sortOrder as statusSortOrder",
-          "requestStatus.allowEdit as statusAllowEdit",
-          "requestStatus.isTerminal as statusIsTerminal",
-          "request.currentApprovalLevel",
-          "request.approvalLocked",
-          "request.isActive",
-          "request.createdAt",
-          "request.updatedAt",
-        ])
-        .whereNull("request.deletedAt");
+          "detailSummary.requestId",
+          "detailSummary.detailCount",
+          "detailSummary.previewDetailId",
 
-      applyRequestScope(query, access, "request");
+          "detail.equipmentUnitId",
+          "equipmentUnit.uuid as equipmentUnitUuid",
+          "equipmentUnit.unitCode as equipmentUnitCode",
+          "equipmentUnit.unitName as equipmentUnitName",
 
-      if (search) {
-        const normalizedSearch = `%${String(search).trim()}%`;
+          "equipmentCategory.code as equipmentCategoryCode",
+          "equipmentCategory.name as equipmentCategoryName",
+        ]);
 
-        query.andWhere((builder) => {
-          builder
-            .where("request.requestNo", "like", normalizedSearch)
-            .orWhere("company.code", "like", normalizedSearch)
-            .orWhere("company.name", "like", normalizedSearch)
-            .orWhere("division.code", "like", normalizedSearch)
-            .orWhere("division.name", "like", normalizedSearch)
-            .orWhere("requester.fullName", "like", normalizedSearch)
-            .orWhere("request.purpose", "like", normalizedSearch)
-            .orWhere("request.notes", "like", normalizedSearch);
+      for (const row of equipmentRows) {
+        equipmentSummaryByRequestId.set(row.requestId, {
+          detailCount: Number(row.detailCount) || 0,
+          details: row.previewDetailId
+            ? [
+                {
+                  equipmentUnitId: row.equipmentUnitId,
+                  equipmentUnitUuid: row.equipmentUnitUuid,
+                  equipmentUnitCode: row.equipmentUnitCode,
+                  equipmentUnitName: row.equipmentUnitName,
+                  equipmentCategoryCode: row.equipmentCategoryCode,
+                  equipmentCategoryName: row.equipmentCategoryName,
+                },
+              ]
+            : [],
         });
       }
+    }
 
-      if (status) {
-        query.andWhere("request.status", String(status).trim().toUpperCase());
+    const approvalPermissions = new Set([
+      "EQUIPMENT_APPROVAL.CLIENT_APPROVE",
+      "EQUIPMENT_APPROVAL.CLIENT_REJECT",
+      "EQUIPMENT_APPROVAL.GTSI_APPROVE",
+      "EQUIPMENT_APPROVAL.GTSI_REJECT",
+    ]);
+
+    const actionsByStatus = await findAvailableActionsByStatuses(
+      requests.map((request) => request.status),
+      access,
+    );
+
+    const result = [];
+
+    for (const request of requests) {
+      const availableActions = actionsByStatus.get(request.status) ?? [];
+
+      const approvalActions = availableActions.filter((action) =>
+        approvalPermissions.has(action.permissionCode),
+      );
+
+      if (approvalActions.length === 0) {
+        continue;
       }
 
-      if (companyUuid) {
-        query.andWhere("company.uuid", String(companyUuid).trim());
+      const equipmentSummary = equipmentSummaryByRequestId.get(request.id);
+
+      result.push({
+        ...normalizeRequestResult(request),
+        details: equipmentSummary?.details ?? [],
+        detailCount: equipmentSummary?.detailCount ?? 0,
+        availableActions: approvalActions,
+      });
+    }
+
+    return res.success(result);
+  } catch (error) {
+    console.error("GET /equipment-request/approval error:", error);
+    return res.fail(error.message || "Failed to load approval requests.");
+  }
+});
+
+router.get(
+  "/:uuid/review",
+  authorization("EQUIPMENT_APPROVAL.VIEW"),
+  async (req, res) => {
+    try {
+      const access = await getRequestAccess(req);
+
+      const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
+
+      if (!equipmentRequest) {
+        return res.incomplete("Equipment request tidak ditemukan.");
       }
 
-      if (divisionUuid) {
-        query.andWhere("division.uuid", String(divisionUuid).trim());
-      }
-
-      if (startDate) {
-        const normalizedStartDate = normalizeDate(startDate);
-
-        if (!normalizedStartDate) {
-          return res.incomplete(
-            "Query startDate harus menggunakan format YYYY-MM-DD HH:mm.",
-          );
-        }
-
-        query.andWhere("request.endDate", ">=", normalizedStartDate);
-      }
-
-      if (endDate) {
-        const normalizedEndDate = normalizeDate(endDate);
-
-        if (!normalizedEndDate) {
-          return res.incomplete("Query endDate tidak valid.");
-        }
-
-        query.andWhere("request.startDate", "<=", normalizedEndDate);
-      }
-
-      if (isActive !== undefined) {
-        query.andWhere("request.isActive", parseBooleanQuery(isActive));
-      }
-
-      const requests = await query.orderBy([
-        { column: "request.requestDate", order: "desc" },
-        { column: "request.id", order: "desc" },
+      const [details, availableActions] = await Promise.all([
+        findRequestDetails(equipmentRequest.id),
+        findAvailableActions(equipmentRequest.status, access),
       ]);
 
-      const requestIds = requests.map((item) => item.id);
+      let requestedStartDate = equipmentRequest.startDate;
+      let requestedEndDate = equipmentRequest.endDate;
 
-      const detailSummaryByRequestId = new Map();
+      if (req.query?.startDate || req.query?.endDate) {
+        const reviewedSchedule = normalizeReviewSchedulePayload(req.query);
 
-      if (requestIds.length > 0) {
-        const detailSummaryQuery = db("equipmentRequestDetails")
-          .select("requestId")
-          .min({ previewDetailId: "id" })
-          .count({ detailCount: "id" })
-          .whereIn("requestId", requestIds)
-          .whereNull("deletedAt")
-          .groupBy("requestId")
-          .as("detailSummary");
-
-        const detailSummaries = await db
-          .from(detailSummaryQuery)
-          .leftJoin(
-            "equipmentRequestDetails as erd",
-            "erd.id",
-            "detailSummary.previewDetailId",
-          )
-          .leftJoin(
-            "equipmentCategories as ec",
-            "ec.id",
-            "erd.equipmentCategoryId",
-          )
-          .leftJoin("equipmentUnits as eu", "eu.id", "erd.equipmentUnitId")
-          .select([
-            "detailSummary.requestId",
-            "detailSummary.detailCount",
-            "detailSummary.previewDetailId",
-            "erd.uuid",
-
-            "erd.equipmentCategoryId",
-            "ec.code as equipmentCategoryCode",
-            "ec.name as equipmentCategoryName",
-
-            "erd.equipmentUnitId",
-            "eu.unitCode as equipmentUnitCode",
-            "eu.unitName as equipmentUnitName",
-
-            "erd.requiredCapacityValue",
-            "erd.requiredCapacityUnit",
-          ]);
-
-        for (const detail of detailSummaries) {
-          detailSummaryByRequestId.set(detail.requestId, {
-            detailCount: Number(detail.detailCount) || 0,
-            details: detail.previewDetailId
-              ? [
-                  {
-                    uuid: detail.uuid,
-
-                    equipmentCategoryId: detail.equipmentCategoryId,
-                    equipmentCategoryCode: detail.equipmentCategoryCode,
-                    equipmentCategoryName: detail.equipmentCategoryName,
-
-                    equipmentUnitId: detail.equipmentUnitId,
-                    equipmentUnitCode: detail.equipmentUnitCode,
-                    equipmentUnitName: detail.equipmentUnitName,
-
-                    requiredCapacityValue:
-                      detail.requiredCapacityValue === null ||
-                      detail.requiredCapacityValue === undefined
-                        ? null
-                        : Number(detail.requiredCapacityValue),
-                    requiredCapacityUnit: detail.requiredCapacityUnit,
-                  },
-                ]
-              : [],
-          });
+        if (!reviewedSchedule.valid) {
+          return res.incomplete(reviewedSchedule.message);
         }
+
+        requestedStartDate = reviewedSchedule.startDate;
+        requestedEndDate = reviewedSchedule.endDate;
       }
 
-      const actionsByStatus = await findAvailableActionsByStatuses(
-        requests.map((request) => request.status),
-        access,
-      );
+      const detailsWithAvailability =
+        await enrichRequestDetailsWithAvailability({
+          details,
+          requestId: equipmentRequest.id,
+          requestedStartDate,
+          requestedEndDate,
+        });
 
-      const requestsWithActions = requests.map((request) => {
-        const detailSummary = detailSummaryByRequestId.get(request.id);
-
-        return {
-          ...normalizeRequestResult(request),
-          details: detailSummary?.details ?? [],
-          detailCount: detailSummary?.detailCount ?? 0,
-          availableActions: actionsByStatus.get(request.status) ?? [],
-        };
+      return res.success({
+        ...normalizeRequestResult(equipmentRequest),
+        details: detailsWithAvailability,
+        availableActions,
       });
-      return res.success(requestsWithActions);
     } catch (error) {
-      console.error("GET /equipment-request error:", error);
-
-      return res.fail(error.message || "Failed to load equipment requests.");
-    }
-  })
-
-  .get("/request-statuses", async (req, res) => {
-    try {
-      const statuses = await db("equipmentRequestStatuses")
-        .select(
-          "id",
-          "uuid",
-          "code",
-          "name",
-          "description",
-          "stage",
-          "sortOrder",
-          "allowEdit",
-          "isTerminal",
-          "isActive",
-        )
-        .where("isActive", 1)
-        .orderBy("sortOrder", "asc");
-
-      return res.success(statuses);
-    } catch (error) {
-      return res.err(
-        500,
-        error.message || "Failed to retrieve request statuses",
+      console.error(
+        "GET /equipment-request/approval/:uuid/review error:",
+        error,
       );
+
+      return res.fail(error.message || "Failed to load approval review.");
     }
-  })
-  /**
-   * GET /equipment-request/:uuid
-   */
-  .get("/:uuid", authorization("EQUIPMENT_REQUEST.VIEW"), async (req, res) => {
+  },
+);
+
+/**
+ * GET /equipment-request/approval/:uuid
+ */
+router.get(
+  "/:uuid",
+  authorization("EQUIPMENT_APPROVAL.VIEW"),
+  async (req, res) => {
     try {
       const access = await getRequestAccess(req);
       const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
@@ -309,387 +339,34 @@ router
           findAvailableActions(equipmentRequest.status, access),
         ]);
 
+      const detailsWithAvailability =
+        await enrichRequestDetailsWithAvailability({
+          details,
+          requestId: equipmentRequest.id,
+          requestedStartDate: equipmentRequest.startDate,
+          requestedEndDate: equipmentRequest.endDate,
+        });
+
       return res.success({
         ...normalizeRequestResult(equipmentRequest),
-        details,
+        details: detailsWithAvailability,
         approvals,
         histories,
         availableActions,
       });
     } catch (error) {
-      console.error("GET /equipment-request/:uuid error:", error);
-
-      return res.fail(error.message || "Failed to load equipment request.");
+      console.error("GET /equipment-request/approval/:uuid error:", error);
+      return res.fail(error.message || "Failed to load approval request.");
     }
-  })
-
-  /**
-   * POST /equipment-request
-   */
-  .post("/", authorization("EQUIPMENT_REQUEST.CREATE"), async (req, res) => {
-    const trx = await db.transaction();
-
-    try {
-      const access = await getRequestAccess(req);
-      const payload = normalizePayload(req.body);
-      const validation = validatePayload(payload);
-
-      if (!validation.valid) {
-        await trx.rollback();
-
-        return res.incomplete(validation.message);
-      }
-
-      const companyId = await resolveCompanyId(
-        trx,
-        payload.companyUuid,
-        access,
-      );
-
-      if (!companyId) {
-        await trx.rollback();
-
-        return res.incomplete("Company tidak valid atau tidak aktif.");
-      }
-
-      const divisionId = await resolveDivisionId(
-        trx,
-        payload.divisionUuid,
-        companyId,
-      );
-
-      if (payload.divisionUuid && !divisionId) {
-        await trx.rollback();
-
-        return res.incomplete(
-          "Division tidak valid, tidak aktif, atau bukan milik company tersebut.",
-        );
-      }
-
-      const detailValidation = await validateDetails(
-        trx,
-        payload.details,
-        null,
-        payload.startDate,
-        payload.endDate,
-      );
-
-      if (!detailValidation.valid) {
-        await trx.rollback();
-
-        return res.incomplete(detailValidation.message);
-      }
-
-      const draftStatus = await trx("equipmentRequestStatuses")
-        .where("code", STATUS_DRAFT)
-        .where("isActive", 1)
-        .whereNull("deletedAt")
-        .first(["code", "allowEdit"]);
-
-      if (!draftStatus) {
-        await trx.rollback();
-
-        return res.incomplete(
-          `Status ${STATUS_DRAFT} belum tersedia atau tidak aktif.`,
-        );
-      }
-
-      const now = db.fn.now();
-      const uuid = randomUUID();
-      const requestNo = await generateRequestNo(trx);
-
-      const insertResult = await trx("equipmentRequests").insert({
-        uuid,
-        requestNo,
-        companyId,
-        divisionId,
-        requestBy: access.user.id,
-        requestDate: new Date(),
-        startDate: payload.startDate,
-        endDate: payload.endDate,
-        purpose: payload.purpose,
-        notes: payload.notes,
-        status: STATUS_DRAFT,
-        currentApprovalLevel: 1,
-        approvalLocked: false,
-        isActive: true,
-        createdAt: now,
-        updatedAt: now,
-        deletedAt: null,
-      });
-
-      const requestId = getInsertedId(insertResult);
-
-      await insertRequestDetails(trx, requestId, payload.details, now);
-
-      await insertRequestHistory(trx, {
-        requestId,
-        activity: "CREATE",
-        description: `Equipment request ${requestNo} dibuat sebagai draft.`,
-        userId: access.user.id,
-        createdAt: now,
-      });
-
-      await trx.commit();
-
-      const equipmentRequest = await findRequestByUuid(uuid, access);
-      const details = await findRequestDetails(equipmentRequest.id);
-
-      return res.success({
-        ...normalizeRequestResult(equipmentRequest),
-        details,
-      });
-    } catch (error) {
-      await trx.rollback();
-
-      console.error("POST /equipment-request error:", error);
-
-      return res.fail(error.message || "Failed to create equipment request.");
-    }
-  })
-
-  /**
-   * PUT /equipment-request/:uuid
-   */
-  .put(
-    "/:uuid",
-    authorization("EQUIPMENT_REQUEST.UPDATE"),
-    async (req, res) => {
-      const trx = await db.transaction();
-
-      try {
-        const access = await getRequestAccess(req);
-        const existingRequest = await findRequestForUpdate(
-          trx,
-          req.params.uuid,
-          access,
-        );
-
-        if (!existingRequest) {
-          await trx.rollback();
-
-          return res.incomplete("Equipment request tidak ditemukan.");
-        }
-
-        if (Boolean(existingRequest.approvalLocked)) {
-          await trx.rollback();
-
-          return res.incomplete(
-            "Equipment request sudah dikunci dan tidak dapat diubah.",
-          );
-        }
-
-        if (!Boolean(existingRequest.statusAllowEdit)) {
-          await trx.rollback();
-
-          return res.incomplete(
-            `Equipment request dengan status ${existingRequest.status} tidak dapat diubah.`,
-          );
-        }
-
-        const payload = normalizePayload(req.body);
-        const validation = validatePayload(payload);
-
-        if (!validation.valid) {
-          await trx.rollback();
-
-          return res.incomplete(validation.message);
-        }
-
-        const companyId = await resolveCompanyId(
-          trx,
-          payload.companyUuid,
-          access,
-          existingRequest.companyId,
-        );
-
-        if (!companyId) {
-          await trx.rollback();
-
-          return res.incomplete("Company tidak valid atau tidak aktif.");
-        }
-
-        const divisionId = await resolveDivisionId(
-          trx,
-          payload.divisionUuid,
-          companyId,
-        );
-
-        if (payload.divisionUuid && !divisionId) {
-          await trx.rollback();
-
-          return res.incomplete(
-            "Division tidak valid, tidak aktif, atau bukan milik company tersebut.",
-          );
-        }
-
-        const detailValidation = await validateDetails(
-          trx,
-          payload.details,
-          existingRequest.id,
-          payload.startDate,
-          payload.endDate,
-        );
-
-        if (!detailValidation.valid) {
-          await trx.rollback();
-
-          return res.incomplete(detailValidation.message);
-        }
-
-        const now = db.fn.now();
-
-        await trx("equipmentRequests").where("id", existingRequest.id).update({
-          companyId,
-          divisionId,
-          startDate: payload.startDate,
-          endDate: payload.endDate,
-          purpose: payload.purpose,
-          notes: payload.notes,
-          updatedAt: now,
-        });
-
-        await synchronizeRequestDetails(
-          trx,
-          existingRequest.id,
-          payload.details,
-          now,
-        );
-
-        await insertRequestHistory(trx, {
-          requestId: existingRequest.id,
-          activity: "UPDATE",
-          description: `Equipment request ${existingRequest.requestNo} diperbarui.`,
-          userId: access.user.id,
-          createdAt: now,
-        });
-
-        await trx.commit();
-
-        const equipmentRequest = await findRequestByUuid(
-          req.params.uuid,
-          access,
-        );
-        const details = await findRequestDetails(equipmentRequest.id);
-
-        return res.success({
-          ...normalizeRequestResult(equipmentRequest),
-          details,
-        });
-      } catch (error) {
-        await trx.rollback();
-
-        console.error("PUT /equipment-request/:uuid error:", error);
-
-        return res.fail(error.message || "Failed to update equipment request.");
-      }
-    },
-  )
-
-  /**
-   * DELETE /equipment-request/:uuid
-   *
-   * Soft delete. Only DRAFT requests may be deleted.
-   */
-  .delete(
-    "/:uuid",
-    authorization("EQUIPMENT_REQUEST.DELETE"),
-    async (req, res) => {
-      const trx = await db.transaction();
-
-      try {
-        const access = await getRequestAccess(req);
-        const equipmentRequest = await findRequestForUpdate(
-          trx,
-          req.params.uuid,
-          access,
-        );
-
-        if (!equipmentRequest) {
-          await trx.rollback();
-
-          return res.incomplete("Equipment request tidak ditemukan.");
-        }
-
-        if (Boolean(equipmentRequest.approvalLocked)) {
-          await trx.rollback();
-
-          return res.incomplete(
-            "Equipment request sudah dikunci dan tidak dapat dihapus.",
-          );
-        }
-
-        if (equipmentRequest.status !== STATUS_DRAFT) {
-          await trx.rollback();
-
-          return res.incomplete(
-            "Hanya equipment request berstatus DRAFT yang dapat dihapus.",
-          );
-        }
-
-        const now = db.fn.now();
-
-        await trx("equipmentRequestDetails")
-          .where("requestId", equipmentRequest.id)
-          .whereNull("deletedAt")
-          .update({
-            isActive: false,
-            updatedAt: now,
-            deletedAt: now,
-          });
-
-        await trx("equipmentRequests").where("id", equipmentRequest.id).update({
-          isActive: false,
-          updatedAt: now,
-          deletedAt: now,
-        });
-
-        await insertRequestHistory(trx, {
-          requestId: equipmentRequest.id,
-          activity: "DELETE",
-          description: `Equipment request ${equipmentRequest.requestNo} dihapus.`,
-          userId: access.user.id,
-          createdAt: now,
-        });
-
-        await trx.commit();
-
-        return res.success({
-          uuid: equipmentRequest.uuid,
-        });
-      } catch (error) {
-        await trx.rollback();
-
-        console.error("DELETE /equipment-request/:uuid error:", error);
-
-        return res.fail(error.message || "Failed to delete equipment request.");
-      }
-    },
-  )
-
-  /**
-   * POST /equipment-request/:uuid/action
-   *
-   * Body:
-   * - actionCode
-   * - remarks
-   */
-  .post("/:uuid/action", async (req, res) => {
-    return executeRequestAction(req, res, req.body?.actionCode);
-  })
-
-  /**
-   * POST /equipment-request/:uuid/submit
-   *
-   * Backward-compatible alias for actionCode SUBMIT.
-   */
-  .post(
-    "/:uuid/submit",
-    authorization("EQUIPMENT_REQUEST.SUBMIT"),
-    async (req, res) => {
-      return executeRequestAction(req, res, ACTION_SUBMIT);
-    },
-  );
+  },
+);
+
+/**
+ * POST /equipment-request/approval/:uuid/action
+ */
+router.post("/:uuid/action", async (req, res) =>
+  executeRequestAction(req, res),
+);
 
 async function executeRequestAction(req, res, forcedActionCode = null) {
   const trx = await db.transaction();
@@ -771,6 +448,44 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       return res.incomplete("Remarks wajib diisi untuk action ini.");
     }
 
+    let reviewedSchedule = null;
+
+    if ([ACTION_APPROVE_CLIENT, ACTION_APPROVE_GTSI].includes(actionCode)) {
+      reviewedSchedule = normalizeReviewSchedulePayload(req.body);
+
+      if (!reviewedSchedule.valid) {
+        await trx.rollback();
+
+        return res.incomplete(reviewedSchedule.message);
+      }
+
+      const unitLock = await lockRequestEquipmentUnits(
+        trx,
+        equipmentRequest.id,
+      );
+
+      if (!unitLock.valid) {
+        await trx.rollback();
+
+        return res.incomplete(unitLock.message);
+      }
+
+      const availabilityValidation = await validateFinalRequestAvailability(
+        trx,
+        {
+          requestId: equipmentRequest.id,
+          startDate: reviewedSchedule.startDate,
+          endDate: reviewedSchedule.endDate,
+        },
+      );
+
+      if (!availabilityValidation.valid) {
+        await trx.rollback();
+
+        return res.incomplete(availabilityValidation.message);
+      }
+    }
+
     if (actionCode === ACTION_SUBMIT) {
       const activeDetails = await trx("equipmentRequestDetails")
         .where("requestId", equipmentRequest.id)
@@ -831,22 +546,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       return res.incomplete(approvalResult.message);
     }
 
-    const shouldUpdateSchedule = SCHEDULE_REVIEW_ACTIONS.has(actionCode);
-
-    const reviewSchedule = shouldUpdateSchedule
-      ? normalizeReviewSchedulePayload(req.body)
-      : {
-          valid: true,
-          startDate: equipmentRequest.startDate,
-          endDate: equipmentRequest.endDate,
-        };
-
-    if (shouldUpdateSchedule && !reviewSchedule.valid) {
-      await trx.rollback();
-
-      return res.incomplete(reviewSchedule.message);
-    }
-
     const now = db.fn.now();
     const nextApprovalLevel = await findNextPendingApprovalLevel(
       trx,
@@ -861,9 +560,9 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       updatedAt: now,
     };
 
-    if (shouldUpdateSchedule) {
-      requestUpdatePayload.startDate = reviewSchedule.startDate;
-      requestUpdatePayload.endDate = reviewSchedule.endDate;
+    if (reviewedSchedule) {
+      requestUpdatePayload.startDate = reviewedSchedule.startDate;
+      requestUpdatePayload.endDate = reviewedSchedule.endDate;
     }
 
     await trx("equipmentRequests")
@@ -876,8 +575,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       description: buildActionHistoryDescription({
         transition,
         remarks,
-        reviewSchedule,
-        scheduleUpdated: shouldUpdateSchedule,
       }),
       userId: access.user.id,
       createdAt: now,
@@ -888,11 +585,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       transition,
       actionUserId: access.user.id,
       remarks,
-    });
-
-    await enqueueRequestActionMenuNotifications(trx, {
-      equipmentRequest,
-      transition,
     });
 
     await trx.commit();
@@ -919,6 +611,172 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       error.message || "Failed to process equipment request action.",
     );
   }
+}
+
+async function validateFinalRequestAvailability(
+  trx,
+  { requestId, startDate, endDate },
+) {
+  const requestDetails = await trx("equipmentRequestDetails as detail")
+    .leftJoin(
+      "equipmentUnits as equipmentUnit",
+      "equipmentUnit.id",
+      "detail.equipmentUnitId",
+    )
+    .where("detail.requestId", requestId)
+    .where("detail.isActive", true)
+    .whereNull("detail.deletedAt")
+    .select([
+      "detail.id",
+      "detail.equipmentUnitId",
+      "equipmentUnit.unitCode as unitCode",
+    ]);
+
+  if (requestDetails.length === 0) {
+    return {
+      valid: false,
+      message: "Equipment request tidak memiliki detail aktif untuk disetujui.",
+    };
+  }
+
+  if (requestDetails.some((detail) => !detail.equipmentUnitId)) {
+    return {
+      valid: false,
+      message: "Seluruh request detail wajib memiliki equipment unit.",
+    };
+  }
+
+  const equipmentUnitIds = [
+    ...new Set(requestDetails.map((detail) => detail.equipmentUnitId)),
+  ];
+
+  const [reservedRequests, activeAssignments] = await Promise.all([
+    trx("equipmentRequestDetails as otherDetail")
+      .join(
+        "equipmentRequests as otherRequest",
+        "otherRequest.id",
+        "otherDetail.requestId",
+      )
+      .whereIn("otherDetail.equipmentUnitId", equipmentUnitIds)
+      .whereNot("otherRequest.id", requestId)
+      .whereIn("otherRequest.status", ["APPROVED", "ASSIGNED", "IN_PROGRESS"])
+      .where("otherRequest.isActive", true)
+      .whereNull("otherRequest.deletedAt")
+      .where("otherDetail.isActive", true)
+      .whereNull("otherDetail.deletedAt")
+      .where("otherRequest.startDate", "<=", endDate)
+      .where("otherRequest.endDate", ">=", startDate)
+      .select([
+        "otherDetail.equipmentUnitId",
+        "otherRequest.requestNo",
+        "otherRequest.startDate",
+        "otherRequest.endDate",
+        "otherRequest.status",
+      ])
+      .orderBy("otherDetail.equipmentUnitId", "asc")
+      .orderBy("otherRequest.startDate", "asc"),
+
+    trx("equipmentAssignments as assignment")
+      .leftJoin(
+        "equipmentRequestDetails as assignmentDetail",
+        "assignmentDetail.id",
+        "assignment.requestDetailId",
+      )
+      .whereIn("assignment.equipmentUnitId", equipmentUnitIds)
+      .whereNot("assignmentDetail.requestId", requestId)
+      .where("assignment.isActive", true)
+      .whereNull("assignment.deletedAt")
+      .whereNotIn("assignment.statusCode", ["CANCELLED"])
+      .where("assignment.plannedStartDate", "<=", endDate)
+      .andWhere((builder) => {
+        builder.whereNull("assignment.actualEndDate").orWhereRaw(
+          `
+              COALESCE(
+                GREATEST(
+                  assignment.plannedEndDate,
+                  assignment.actualEndDate
+                ),
+                assignment.plannedEndDate
+              ) >= ?
+              `,
+          [startDate],
+        );
+      })
+      .select([
+        "assignment.equipmentUnitId",
+        "assignment.statusCode",
+        "assignment.plannedStartDate",
+        "assignment.plannedEndDate",
+        "assignment.actualEndDate",
+      ])
+      .orderBy("assignment.equipmentUnitId", "asc")
+      .orderBy("assignment.plannedStartDate", "asc"),
+  ]);
+
+  const reservedRequestByUnitId = new Map();
+
+  for (const reservedRequest of reservedRequests) {
+    if (!reservedRequestByUnitId.has(reservedRequest.equipmentUnitId)) {
+      reservedRequestByUnitId.set(
+        reservedRequest.equipmentUnitId,
+        reservedRequest,
+      );
+    }
+  }
+
+  const activeAssignmentByUnitId = new Map();
+
+  for (const activeAssignment of activeAssignments) {
+    if (!activeAssignmentByUnitId.has(activeAssignment.equipmentUnitId)) {
+      activeAssignmentByUnitId.set(
+        activeAssignment.equipmentUnitId,
+        activeAssignment,
+      );
+    }
+  }
+
+  for (const detail of requestDetails) {
+    const reservedRequest = reservedRequestByUnitId.get(detail.equipmentUnitId);
+
+    if (reservedRequest) {
+      return {
+        valid: false,
+        message:
+          `Equipment unit ${detail.unitCode} sudah digunakan oleh ` +
+          `request ${reservedRequest.requestNo} pada periode ` +
+          `${reservedRequest.startDate} sampai ` +
+          `${reservedRequest.endDate}.`,
+      };
+    }
+
+    const activeAssignment = activeAssignmentByUnitId.get(
+      detail.equipmentUnitId,
+    );
+
+    if (activeAssignment) {
+      const availableAt = getAssignmentEffectiveEndDate(activeAssignment);
+
+      if (!activeAssignment.actualEndDate) {
+        return {
+          valid: false,
+          message:
+            `Equipment unit ${detail.unitCode} masih memiliki ` +
+            "assignment yang belum diselesaikan.",
+        };
+      }
+
+      return {
+        valid: false,
+        message:
+          `Equipment unit ${detail.unitCode} belum tersedia. ` +
+          `Unit baru dapat digunakan setelah ${availableAt}.`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+  };
 }
 
 async function findRequestByUuid(uuid, access, trx = db) {
@@ -1006,36 +864,33 @@ async function findRequestForUpdate(trx, uuid, access) {
 
 async function findRequestDetails(requestId, trx = db) {
   const details = await trx("equipmentRequestDetails as detail")
-    .leftJoin("equipmentCategories as category", function () {
-      this.on("category.id", "=", "detail.equipmentCategoryId").andOnNull(
-        "category.deletedAt",
-      );
-    })
-    .leftJoin("equipmentUnits as equipmentUnit", function () {
-      this.on("equipmentUnit.id", "=", "detail.equipmentUnitId").andOnNull(
-        "equipmentUnit.deletedAt",
-      );
-    })
+    .leftJoin(
+      "equipmentCategories as equipmentCategory",
+      "equipmentCategory.id",
+      "detail.equipmentCategoryId",
+    )
+    .leftJoin(
+      "equipmentUnits as equipmentUnit",
+      "equipmentUnit.id",
+      "detail.equipmentUnitId",
+    )
     .select([
       "detail.id",
       "detail.uuid",
       "detail.requestId",
       "detail.equipmentCategoryId",
-      "category.uuid as equipmentCategoryUuid",
-      "category.code as equipmentCategoryCode",
-      "category.name as equipmentCategoryName",
-      "category.icon as equipmentCategoryIcon",
+      "equipmentCategory.code as equipmentCategoryCode",
+      "equipmentCategory.name as equipmentCategoryName",
       "detail.equipmentUnitId",
-      "detail.requiredCapacityValue",
-      "detail.requiredCapacityUnit",
       "equipmentUnit.uuid as equipmentUnitUuid",
       "equipmentUnit.unitCode as equipmentUnitCode",
       "equipmentUnit.unitName as equipmentUnitName",
       "equipmentUnit.assetNumber as equipmentUnitAssetNumber",
-      "equipmentUnit.modelNumber as equipmentUnitModelNumber",
-      "equipmentUnit.plateNumber as equipmentUnitPlateNumber",
       "equipmentUnit.capacityValue as equipmentUnitCapacityValue",
       "equipmentUnit.capacityUnit as equipmentUnitCapacityUnit",
+      "detail.requiredCapacityValue",
+      "detail.requiredCapacityUnit",
+      "detail.quantity",
       "detail.rate",
       "detail.remarks",
       "detail.isActive",
@@ -1048,6 +903,7 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
+    quantity: Number(detail.quantity || 1),
     requiredCapacityValue:
       detail.requiredCapacityValue === null
         ? null
@@ -1059,6 +915,327 @@ async function findRequestDetails(requestId, trx = db) {
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
+}
+
+async function enrichRequestDetailsWithAvailability({
+  details,
+  requestId,
+  requestedStartDate,
+  requestedEndDate,
+  trx = db,
+}) {
+  const equipmentUnitIds = [
+    ...new Set(details.map((detail) => detail.equipmentUnitId).filter(Boolean)),
+  ];
+
+  const statusMapPromise = getAvailabilityStatusMap(trx);
+
+  if (equipmentUnitIds.length === 0) {
+    const statusMap = await statusMapPromise;
+
+    return details.map((detail) => {
+      const status = "UNIT_NOT_SELECTED";
+
+      return {
+        ...detail,
+        availability: {
+          isAvailableForRequestedPeriod: false,
+          status,
+          statusName: statusMap.get(status) || status,
+          lastUsageStartDate: null,
+          lastUsageEndDate: null,
+          availableFrom: null,
+          conflictRequestNo: null,
+          conflictCompanyUuid: null,
+          conflictCompanyCode: null,
+          conflictCompanyName: null,
+          conflictRequesterUuid: null,
+          conflictRequesterName: null,
+          conflictStartDate: null,
+          conflictEndDate: null,
+        },
+      };
+    });
+  }
+
+  const [
+    statusMap,
+    lastAssignments,
+    conflictingRequests,
+    conflictingAssignments,
+  ] = await Promise.all([
+    statusMapPromise,
+
+    trx("equipmentAssignments as assignment")
+      .leftJoin(
+        "equipmentRequestDetails as assignmentDetail",
+        "assignmentDetail.id",
+        "assignment.requestDetailId",
+      )
+      .whereIn("assignment.equipmentUnitId", equipmentUnitIds)
+      .whereNot("assignmentDetail.requestId", requestId)
+      .where("assignment.isActive", true)
+      .whereNull("assignment.deletedAt")
+      .whereNotIn("assignment.statusCode", ["CANCELLED"])
+      .andWhereRaw(
+        `
+        COALESCE(
+          GREATEST(
+            assignment.plannedEndDate,
+            assignment.actualEndDate
+          ),
+          assignment.plannedEndDate
+        ) <= ?
+      `,
+        [requestedStartDate],
+      )
+      .select([
+        "assignment.equipmentUnitId",
+        "assignment.statusCode",
+        "assignment.plannedStartDate",
+        "assignment.plannedEndDate",
+        "assignment.actualEndDate",
+      ])
+      .orderBy("assignment.equipmentUnitId", "asc")
+      .orderByRaw(
+        `
+        COALESCE(
+          GREATEST(
+            assignment.plannedEndDate,
+            assignment.actualEndDate
+          ),
+          assignment.plannedEndDate
+        ) DESC
+      `,
+      ),
+
+    trx("equipmentRequestDetails as otherDetail")
+      .join(
+        "equipmentRequests as otherRequest",
+        "otherRequest.id",
+        "otherDetail.requestId",
+      )
+      .leftJoin("companies as otherCompany", function () {
+        this.on("otherCompany.id", "=", "otherRequest.companyId").andOnNull(
+          "otherCompany.deletedAt",
+        );
+      })
+      .leftJoin("users as otherRequester", function () {
+        this.on("otherRequester.id", "=", "otherRequest.requestBy").andOnNull(
+          "otherRequester.deletedAt",
+        );
+      })
+      .whereIn("otherDetail.equipmentUnitId", equipmentUnitIds)
+      .whereNot("otherRequest.id", requestId)
+      .whereIn("otherRequest.status", ["APPROVED", "ASSIGNED", "IN_PROGRESS"])
+      .where("otherRequest.isActive", true)
+      .whereNull("otherRequest.deletedAt")
+      .where("otherDetail.isActive", true)
+      .whereNull("otherDetail.deletedAt")
+      .where("otherRequest.startDate", "<=", requestedEndDate)
+      .where("otherRequest.endDate", ">=", requestedStartDate)
+      .select([
+        "otherDetail.equipmentUnitId",
+        "otherRequest.requestNo",
+        "otherRequest.startDate",
+        "otherRequest.endDate",
+        "otherRequest.status",
+        "otherCompany.uuid as companyUuid",
+        "otherCompany.code as companyCode",
+        "otherCompany.name as companyName",
+        "otherRequester.uuid as requesterUuid",
+        "otherRequester.fullName as requesterName",
+      ])
+      .orderBy("otherDetail.equipmentUnitId", "asc")
+      .orderBy("otherRequest.startDate", "asc"),
+
+    trx("equipmentAssignments as assignment")
+      .leftJoin(
+        "equipmentRequestDetails as assignmentDetail",
+        "assignmentDetail.id",
+        "assignment.requestDetailId",
+      )
+      .whereIn("assignment.equipmentUnitId", equipmentUnitIds)
+      .whereNot("assignmentDetail.requestId", requestId)
+      .where("assignment.isActive", true)
+      .whereNull("assignment.deletedAt")
+      .whereNotIn("assignment.statusCode", ["CANCELLED"])
+      .where("assignment.plannedStartDate", "<=", requestedEndDate)
+      .andWhere((builder) => {
+        builder.whereNull("assignment.actualEndDate").orWhereRaw(
+          `
+            GREATEST(
+              assignment.plannedEndDate,
+              assignment.actualEndDate
+            ) >= ?
+          `,
+          [requestedStartDate],
+        );
+      })
+      .select([
+        "assignment.equipmentUnitId",
+        "assignment.statusCode",
+        "assignment.plannedStartDate",
+        "assignment.plannedEndDate",
+        "assignment.actualEndDate",
+      ])
+      .orderBy("assignment.equipmentUnitId", "asc")
+      .orderBy("assignment.plannedStartDate", "asc"),
+  ]);
+
+  const lastAssignmentByUnitId = new Map();
+
+  for (const assignment of lastAssignments) {
+    if (!lastAssignmentByUnitId.has(assignment.equipmentUnitId)) {
+      lastAssignmentByUnitId.set(assignment.equipmentUnitId, assignment);
+    }
+  }
+
+  const conflictingRequestByUnitId = new Map();
+
+  for (const request of conflictingRequests) {
+    if (!conflictingRequestByUnitId.has(request.equipmentUnitId)) {
+      conflictingRequestByUnitId.set(request.equipmentUnitId, request);
+    }
+  }
+
+  const conflictingAssignmentByUnitId = new Map();
+
+  for (const assignment of conflictingAssignments) {
+    if (!conflictingAssignmentByUnitId.has(assignment.equipmentUnitId)) {
+      conflictingAssignmentByUnitId.set(assignment.equipmentUnitId, assignment);
+    }
+  }
+
+  return details.map((detail) => {
+    if (!detail.equipmentUnitId) {
+      const status = "UNIT_NOT_SELECTED";
+
+      return {
+        ...detail,
+        availability: {
+          isAvailableForRequestedPeriod: false,
+          status,
+          statusName: statusMap.get(status) || status,
+          lastUsageStartDate: null,
+          lastUsageEndDate: null,
+          availableFrom: null,
+          conflictRequestNo: null,
+          conflictCompanyUuid: null,
+          conflictCompanyCode: null,
+          conflictCompanyName: null,
+          conflictRequesterUuid: null,
+          conflictRequesterName: null,
+          conflictStartDate: null,
+          conflictEndDate: null,
+        },
+      };
+    }
+
+    const lastAssignment = lastAssignmentByUnitId.get(detail.equipmentUnitId);
+
+    const conflictingRequest = conflictingRequestByUnitId.get(
+      detail.equipmentUnitId,
+    );
+
+    const conflictingAssignment = conflictingAssignmentByUnitId.get(
+      detail.equipmentUnitId,
+    );
+
+    const lastUsageEndDate = getAssignmentEffectiveEndDate(lastAssignment);
+
+    let availability;
+
+    if (conflictingRequest) {
+      availability = {
+        isAvailableForRequestedPeriod: false,
+        status: "RESERVED",
+        lastUsageStartDate: lastAssignment?.plannedStartDate || null,
+        lastUsageEndDate,
+        availableFrom: conflictingRequest.endDate,
+        conflictRequestNo: conflictingRequest.requestNo,
+        conflictCompanyUuid: conflictingRequest.companyUuid || null,
+        conflictCompanyCode: conflictingRequest.companyCode || null,
+        conflictCompanyName: conflictingRequest.companyName || null,
+        conflictRequesterUuid: conflictingRequest.requesterUuid || null,
+        conflictRequesterName: conflictingRequest.requesterName || null,
+        conflictStartDate: conflictingRequest.startDate,
+        conflictEndDate: conflictingRequest.endDate,
+      };
+    } else if (conflictingAssignment) {
+      const conflictingAssignmentEndDate = getAssignmentEffectiveEndDate(
+        conflictingAssignment,
+      );
+
+      availability = {
+        isAvailableForRequestedPeriod: false,
+        status: conflictingAssignment.actualEndDate
+          ? "ASSIGNMENT_CONFLICT"
+          : "ACTIVE_ASSIGNMENT",
+        lastUsageStartDate: lastAssignment?.plannedStartDate || null,
+        lastUsageEndDate,
+        availableFrom: conflictingAssignment.actualEndDate
+          ? conflictingAssignmentEndDate
+          : null,
+        conflictRequestNo: null,
+        conflictCompanyUuid: null,
+        conflictCompanyCode: null,
+        conflictCompanyName: null,
+        conflictRequesterUuid: null,
+        conflictRequesterName: null,
+        conflictStartDate: conflictingAssignment.plannedStartDate,
+        conflictEndDate: conflictingAssignmentEndDate,
+      };
+    } else {
+      availability = {
+        isAvailableForRequestedPeriod: true,
+        status: "AVAILABLE",
+        lastUsageStartDate: lastAssignment?.plannedStartDate || null,
+        lastUsageEndDate,
+        availableFrom: lastUsageEndDate,
+        conflictRequestNo: null,
+        conflictCompanyUuid: null,
+        conflictCompanyCode: null,
+        conflictCompanyName: null,
+        conflictRequesterUuid: null,
+        conflictRequesterName: null,
+        conflictStartDate: null,
+        conflictEndDate: null,
+      };
+    }
+
+    return {
+      ...detail,
+      availability: {
+        ...availability,
+        statusName: statusMap.get(availability.status) || availability.status,
+      },
+    };
+  });
+}
+
+function getAssignmentEffectiveEndDate(assignment) {
+  if (!assignment) {
+    return null;
+  }
+
+  if (!assignment.actualEndDate) {
+    return assignment.plannedEndDate || null;
+  }
+
+  const plannedEndDate = new Date(assignment.plannedEndDate);
+  const actualEndDate = new Date(assignment.actualEndDate);
+
+  if (
+    Number.isNaN(plannedEndDate.getTime()) ||
+    Number.isNaN(actualEndDate.getTime())
+  ) {
+    return assignment.actualEndDate || assignment.plannedEndDate || null;
+  }
+
+  return actualEndDate > plannedEndDate
+    ? assignment.actualEndDate
+    : assignment.plannedEndDate;
 }
 
 async function findRequestApprovals(requestId, trx = db) {
@@ -1242,6 +1419,15 @@ async function findAvailableActions(statusCode, access, trx = db) {
     }));
 }
 
+async function getAvailabilityStatusMap(trx = db) {
+  const rows = await trx("sysLookups")
+    .where("lookupGroup", "equipment_availability_status")
+    .where("isActive", true)
+    .select(["lookupCode", "lookupValue"]);
+
+  return new Map(rows.map((row) => [row.lookupCode, row.lookupValue]));
+}
+
 function normalizeReviewSchedulePayload(payload = {}) {
   const startDate = normalizeDate(payload.startDate);
   const endDate = normalizeDate(payload.endDate);
@@ -1249,21 +1435,21 @@ function normalizeReviewSchedulePayload(payload = {}) {
   if (!startDate) {
     return {
       valid: false,
-      message: "Start date review wajib diisi dengan format YYYY-MM-DD HH:mm.",
+      message: "Start date review wajib diisi dengan format YYYY-MM-DD.",
     };
   }
 
   if (!endDate) {
     return {
       valid: false,
-      message: "End date review wajib diisi dengan format YYYY-MM-DD HH:mm.",
+      message: "End date review wajib diisi dengan format YYYY-MM-DD.",
     };
   }
 
-  if (startDate >= endDate) {
+  if (startDate > endDate) {
     return {
       valid: false,
-      message: "End date review harus lebih besar dari start date review.",
+      message: "End date review tidak boleh lebih kecil dari start date.",
     };
   }
 
@@ -1274,20 +1460,7 @@ function normalizeReviewSchedulePayload(payload = {}) {
   };
 }
 
-function buildActionHistoryDescription({
-  transition,
-  remarks,
-  reviewSchedule,
-  scheduleUpdated,
-}) {
-  if (scheduleUpdated && reviewSchedule?.valid) {
-    const scheduleText =
-      `Jadwal direview menjadi ${reviewSchedule.startDate} ` +
-      `sampai ${reviewSchedule.endDate}.`;
-
-    return remarks ? `${scheduleText} Catatan: ${remarks}` : scheduleText;
-  }
-
+function buildActionHistoryDescription({ transition, remarks }) {
   return (
     remarks ||
     `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`
@@ -1310,13 +1483,6 @@ function normalizePayload(payload = {}) {
         detail?.equipmentCategoryId,
       ),
       equipmentUnitId: normalizePositiveInteger(detail?.equipmentUnitId),
-      requiredCapacityValue: normalizePositiveDecimal(
-        detail?.requiredCapacityValue,
-      ),
-      requiredCapacityUnit: normalizeRequiredString(
-        detail?.requiredCapacityUnit,
-      ).toUpperCase(),
-      quantity: 1,
       rate: normalizeNullableDecimal(detail?.rate),
       remarks: normalizeNullableString(detail?.remarks),
     })),
@@ -1327,23 +1493,21 @@ function validatePayload(payload) {
   if (!payload.startDate) {
     return {
       valid: false,
-      message:
-        "Start date dan waktu wajib diisi dengan format YYYY-MM-DD HH:mm.",
+      message: "Start date wajib diisi dengan format YYYY-MM-DD.",
     };
   }
 
   if (!payload.endDate) {
     return {
       valid: false,
-      message: "End date dan waktu wajib diisi dengan format YYYY-MM-DD HH:mm.",
+      message: "End date wajib diisi dengan format YYYY-MM-DD.",
     };
   }
 
-  if (payload.startDate >= payload.endDate) {
+  if (payload.startDate > payload.endDate) {
     return {
       valid: false,
-      message:
-        "End date dan waktu harus lebih besar dari start date dan waktu.",
+      message: "End date tidak boleh lebih kecil dari start date.",
     };
   }
 
@@ -1386,31 +1550,6 @@ function validatePayload(payload) {
       };
     }
 
-    if (!detail.requiredCapacityValue) {
-      return {
-        valid: false,
-        message:
-          `Required capacity value pada detail baris ${rowNumber} ` +
-          "wajib lebih dari 0.",
-      };
-    }
-
-    if (!detail.requiredCapacityUnit) {
-      return {
-        valid: false,
-        message: `Required capacity unit pada detail baris ${rowNumber} wajib diisi.`,
-      };
-    }
-
-    if (detail.requiredCapacityUnit.length > 50) {
-      return {
-        valid: false,
-        message:
-          `Required capacity unit pada detail baris ${rowNumber} ` +
-          "maksimal 50 karakter.",
-      };
-    }
-
     if (detail.rate !== null && detail.rate < 0) {
       return {
         valid: false,
@@ -1424,81 +1563,7 @@ function validatePayload(payload) {
   };
 }
 
-async function validateEquipmentUnitAvailability(
-  trx,
-  { equipmentUnitId, requestId = null, startDate, endDate },
-) {
-  const query = trx("equipmentAssignments as assignment")
-    .leftJoin(
-      "equipmentRequestDetails as requestDetail",
-      "requestDetail.id",
-      "assignment.requestDetailId",
-    )
-    .where("assignment.equipmentUnitId", equipmentUnitId)
-    .where("assignment.isActive", true)
-    .whereNull("assignment.deletedAt")
-    .whereNull("requestDetail.deletedAt")
-    .whereNotIn("assignment.statusCode", ["CANCELLED"])
-    .where("assignment.plannedStartDate", "<=", endDate)
-    .andWhere((builder) => {
-      builder.whereNull("assignment.actualEndDate").orWhereRaw(
-        `
-            GREATEST(
-              assignment.plannedEndDate,
-              assignment.actualEndDate
-            ) >= ?
-          `,
-        [startDate],
-      );
-    });
-
-  if (requestId) {
-    query.andWhere("requestDetail.requestId", "!=", requestId);
-  }
-
-  const overlap = await query.first([
-    "assignment.id",
-    "assignment.uuid",
-    "assignment.statusCode",
-    "assignment.plannedStartDate",
-    "assignment.plannedEndDate",
-    "assignment.actualEndDate",
-  ]);
-
-  if (!overlap) {
-    return {
-      valid: true,
-    };
-  }
-
-  if (!overlap.actualEndDate) {
-    return {
-      valid: false,
-      message: "Unit masih memiliki assignment aktif yang belum diselesaikan.",
-    };
-  }
-
-  const plannedEndDate = new Date(overlap.plannedEndDate);
-  const actualEndDate = new Date(overlap.actualEndDate);
-
-  const availableAt =
-    actualEndDate > plannedEndDate
-      ? overlap.actualEndDate
-      : overlap.plannedEndDate;
-
-  return {
-    valid: false,
-    message: `Unit baru dapat digunakan setelah ${availableAt}.`,
-  };
-}
-
-async function validateDetails(
-  trx,
-  details,
-  requestId = null,
-  startDate = null,
-  endDate = null,
-) {
+async function validateDetails(trx, details, requestId = null) {
   const categoryIds = [
     ...new Set(details.map((detail) => detail.equipmentCategoryId)),
   ];
@@ -1518,101 +1583,42 @@ async function validateDetails(
 
   const equipmentUnitIds = details.map((detail) => detail.equipmentUnitId);
 
-  if (equipmentUnitIds.some((equipmentUnitId) => !equipmentUnitId)) {
-    return {
-      valid: false,
-      message: "Setiap detail wajib memiliki equipment unit.",
-    };
-  }
-
   if (new Set(equipmentUnitIds).size !== equipmentUnitIds.length) {
     return {
       valid: false,
       message:
-        "Equipment unit yang sama tidak boleh dipilih lebih dari satu kali.",
+        "Equipment unit yang sama tidak boleh dipilih lebih dari satu kali dalam satu request.",
     };
   }
 
-  const equipmentUnits = await trx("equipmentUnits")
+  const units = await trx("equipmentUnits")
     .whereIn("id", equipmentUnitIds)
     .where("isActive", true)
     .whereNull("deletedAt")
-    .select(["id", "categoryId", "unitCode", "capacityValue", "capacityUnit"]);
+    .select(["id", "categoryId"]);
 
-  if (equipmentUnits.length !== equipmentUnitIds.length) {
+  if (units.length !== equipmentUnitIds.length) {
     return {
       valid: false,
       message: "Terdapat equipment unit yang tidak valid atau tidak aktif.",
     };
   }
 
-  const requiredCapacityUnits = [
-    ...new Set(
-      details.map((detail) => detail.requiredCapacityUnit).filter(Boolean),
-    ),
-  ];
-
-  const capacityUnitLookups = await trx("sysLookups")
-    .where("lookupGroup", "equipment_capacity_unit")
-    .whereIn("lookupCode", requiredCapacityUnits)
-    .where("isActive", 1)
-    .whereNull("deletedAt")
-    .select("lookupCode");
-
-  if (capacityUnitLookups.length !== requiredCapacityUnits.length) {
-    return {
-      valid: false,
-      message:
-        "Terdapat required capacity unit yang tidak valid atau tidak aktif.",
-    };
-  }
-
-  const equipmentUnitById = new Map(
-    equipmentUnits.map((equipmentUnit) => [
-      Number(equipmentUnit.id),
-      equipmentUnit,
-    ]),
-  );
+  const unitById = new Map(units.map((unit) => [Number(unit.id), unit]));
 
   for (let index = 0; index < details.length; index += 1) {
     const detail = details[index];
-    const rowNumber = index + 1;
-    const equipmentUnit = equipmentUnitById.get(Number(detail.equipmentUnitId));
+    const unit = unitById.get(Number(detail.equipmentUnitId));
 
     if (
-      Number(equipmentUnit.categoryId) !== Number(detail.equipmentCategoryId)
+      !unit ||
+      Number(unit.categoryId) !== Number(detail.equipmentCategoryId)
     ) {
       return {
         valid: false,
         message:
-          `Equipment unit pada detail baris ${rowNumber} ` +
+          `Equipment unit pada detail baris ${index + 1} ` +
           "tidak sesuai dengan equipment category.",
-      };
-    }
-
-    if (
-      String(equipmentUnit.capacityUnit).toUpperCase() !==
-      detail.requiredCapacityUnit
-    ) {
-      return {
-        valid: false,
-        message:
-          `Satuan kapasitas unit ${equipmentUnit.unitCode} ` +
-          `tidak sesuai dengan kebutuhan pada detail baris ${rowNumber}.`,
-      };
-    }
-
-    if (
-      Number(equipmentUnit.capacityValue) < Number(detail.requiredCapacityValue)
-    ) {
-      return {
-        valid: false,
-        message:
-          `Kapasitas unit ${equipmentUnit.unitCode} tidak mencukupi. ` +
-          `Kapasitas unit ${Number(equipmentUnit.capacityValue)} ` +
-          `${equipmentUnit.capacityUnit}, kebutuhan ` +
-          `${Number(detail.requiredCapacityValue)} ` +
-          `${detail.requiredCapacityUnit}.`,
       };
     }
   }
@@ -1620,31 +1626,6 @@ async function validateDetails(
   const suppliedDetailUuids = details
     .map((detail) => detail.uuid)
     .filter(Boolean);
-
-  if (startDate && endDate) {
-    for (let index = 0; index < details.length; index += 1) {
-      const detail = details[index];
-      const equipmentUnit = equipmentUnitById.get(
-        Number(detail.equipmentUnitId),
-      );
-
-      const scheduleValidation = await validateEquipmentUnitAvailability(trx, {
-        equipmentUnitId: detail.equipmentUnitId,
-        requestId,
-        startDate,
-        endDate,
-      });
-
-      if (!scheduleValidation.valid) {
-        return {
-          valid: false,
-          message:
-            `Equipment unit ${equipmentUnit.unitCode} pada detail baris ` +
-            `${index + 1} tidak tersedia. ${scheduleValidation.message}`,
-        };
-      }
-    }
-  }
 
   if (new Set(suppliedDetailUuids).size !== suppliedDetailUuids.length) {
     return {
@@ -1722,8 +1703,6 @@ async function insertRequestDetails(trx, requestId, details, now) {
     requestId,
     equipmentCategoryId: detail.equipmentCategoryId,
     equipmentUnitId: detail.equipmentUnitId,
-    requiredCapacityValue: detail.requiredCapacityValue,
-    requiredCapacityUnit: detail.requiredCapacityUnit,
     quantity: 1,
     rate: detail.rate,
     remarks: detail.remarks,
@@ -1758,8 +1737,6 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         .update({
           equipmentCategoryId: detail.equipmentCategoryId,
           equipmentUnitId: detail.equipmentUnitId,
-          requiredCapacityValue: detail.requiredCapacityValue,
-          requiredCapacityUnit: detail.requiredCapacityUnit,
           quantity: 1,
           rate: detail.rate,
           remarks: detail.remarks,
@@ -1772,8 +1749,6 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
         requestId,
         equipmentCategoryId: detail.equipmentCategoryId,
         equipmentUnitId: detail.equipmentUnitId,
-        requiredCapacityValue: detail.requiredCapacityValue,
-        requiredCapacityUnit: detail.requiredCapacityUnit,
         quantity: 1,
         rate: detail.rate,
         remarks: detail.remarks,
@@ -1864,7 +1839,7 @@ async function generateRequestApprovals(trx, equipmentRequest) {
       companyId: flow.companyId,
       roleId: flow.roleId,
       userId: null,
-      status: "PENDING",
+      status: APPROVAL_STATUS_PENDING,
       remarks: null,
       actionDate: null,
       isActive: true,
@@ -1882,8 +1857,12 @@ async function processPendingApproval(
   { equipmentRequest, transition, access, remarks },
 ) {
   const actionCode = transition.actionCode;
-  const isApprovalAction =
-    actionCode.includes("APPROVE") || actionCode.includes("REJECT");
+  const isApprovalAction = [
+    ACTION_APPROVE_CLIENT,
+    ACTION_APPROVE_GTSI,
+    ACTION_REJECT_CLIENT,
+    ACTION_REJECT_GTSI,
+  ].includes(actionCode);
 
   if (!isApprovalAction) {
     return { valid: true };
@@ -1903,7 +1882,7 @@ async function processPendingApproval(
   if (userRoleIds.length === 0) {
     return {
       valid: false,
-      message: "User tidak memiliki role approval aktif.",
+      message: "User tidak memiliki role approval.",
     };
   }
 
@@ -1912,7 +1891,7 @@ async function processPendingApproval(
     .where("approvalLevel", equipmentRequest.currentApprovalLevel)
     .where("companyId", access.company.id)
     .whereIn("roleId", userRoleIds)
-    .where("status", "PENDING")
+    .where("status", APPROVAL_STATUS_PENDING)
     .where("isActive", true)
     .whereNull("deletedAt")
     .orderBy("id", "asc")
@@ -1932,7 +1911,9 @@ async function processPendingApproval(
     .where("id", pendingApproval.id)
     .update({
       userId: access.user.id,
-      status: actionCode.includes("REJECT") ? "REJECTED" : "APPROVED",
+      status: [ACTION_REJECT_CLIENT, ACTION_REJECT_GTSI].includes(actionCode)
+        ? APPROVAL_STATUS_REJECTED
+        : APPROVAL_STATUS_APPROVED,
       remarks,
       actionDate: now,
       updatedAt: now,
@@ -1944,7 +1925,7 @@ async function processPendingApproval(
 async function findNextPendingApprovalLevel(trx, requestId) {
   const pendingApproval = await trx("equipmentRequestApprovals")
     .where("requestId", requestId)
-    .where("status", "PENDING")
+    .where("status", APPROVAL_STATUS_PENDING)
     .where("isActive", true)
     .whereNull("deletedAt")
     .orderBy("approvalLevel", "asc")
@@ -2160,20 +2141,6 @@ function normalizePositiveInteger(value) {
   return normalizedValue;
 }
 
-function normalizePositiveDecimal(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  const normalizedValue = Number(value);
-
-  if (!Number.isFinite(normalizedValue) || normalizedValue <= 0) {
-    return null;
-  }
-
-  return normalizedValue;
-}
-
 function normalizeNullableDecimal(value) {
   if (value === null || value === undefined || value === "") {
     return null;
@@ -2223,12 +2190,23 @@ function normalizeDate(value) {
 
   const [, year, month, day, hour, minute, second = "00"] = match;
 
-  const yearNumber = Number(year);
-  const monthNumber = Number(month);
-  const dayNumber = Number(day);
-  const hourNumber = Number(hour);
-  const minuteNumber = Number(minute);
-  const secondNumber = Number(second);
+  const values = [
+    Number(year),
+    Number(month),
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+  ];
+
+  const [
+    yearNumber,
+    monthNumber,
+    dayNumber,
+    hourNumber,
+    minuteNumber,
+    secondNumber,
+  ] = values;
 
   if (hourNumber > 23 || minuteNumber > 59 || secondNumber > 59) {
     return null;
@@ -2271,6 +2249,53 @@ function parseBooleanQuery(value) {
   }
 
   throw new Error("Query isActive harus berupa true atau false.");
+}
+
+async function lockRequestEquipmentUnits(trx, requestId) {
+  const details = await trx("equipmentRequestDetails")
+    .where("requestId", requestId)
+    .where("isActive", true)
+    .whereNull("deletedAt")
+    .select(["id", "equipmentUnitId"])
+    .forUpdate();
+
+  if (details.length === 0) {
+    return {
+      valid: false,
+      message: "Equipment request tidak memiliki detail aktif.",
+    };
+  }
+
+  if (details.some((detail) => !detail.equipmentUnitId)) {
+    return {
+      valid: false,
+      message: "Seluruh request detail wajib memiliki equipment unit.",
+    };
+  }
+
+  const equipmentUnitIds = [
+    ...new Set(details.map((detail) => Number(detail.equipmentUnitId))),
+  ];
+
+  const lockedUnits = await trx("equipmentUnits")
+    .whereIn("id", equipmentUnitIds)
+    .where("isActive", true)
+    .whereNull("deletedAt")
+    .select(["id", "unitCode"])
+    .forUpdate();
+
+  if (lockedUnits.length !== equipmentUnitIds.length) {
+    return {
+      valid: false,
+      message: "Terdapat equipment unit yang tidak ditemukan atau tidak aktif.",
+    };
+  }
+
+  return {
+    valid: true,
+    details,
+    units: lockedUnits,
+  };
 }
 
 module.exports = router;

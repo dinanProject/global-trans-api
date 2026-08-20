@@ -13,6 +13,9 @@ const db = require("../../lib/db")();
 const {
   enqueueRequestActionNotifications,
 } = require("../../services/equipment-request/email");
+const {
+  enqueueRequestActionMenuNotifications,
+} = require("../../services/equipment-request/notification");
 
 const HOLDER_COMPANY_TYPE = 1;
 
@@ -585,6 +588,11 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       transition,
       actionUserId: access.user.id,
       remarks,
+    });
+
+    await enqueueRequestActionMenuNotifications(trx, {
+      equipmentRequest,
+      transition,
     });
 
     await trx.commit();
