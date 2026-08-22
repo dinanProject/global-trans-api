@@ -5,6 +5,7 @@ const { queueTemplateEmails } = require('../email/notification');
 const MODULE_CODE = 'EQUIPMENT_REQUEST';
 const TEMPLATE_APPROVAL_REQUIRED = 'EQUIPMENT_REQUEST_APPROVAL_REQUIRED';
 const TEMPLATE_STATUS_CHANGED = 'EQUIPMENT_REQUEST_STATUS_CHANGED';
+const TEMPLATE_FINAL_DECISION = 'EQUIPMENT_REQUEST_FINAL_DECISION';
 const TEMPLATE_ASSIGNED = 'EQUIPMENT_REQUEST_ASSIGNED';
 const TEMPLATE_OPERATION_STARTED = 'EQUIPMENT_OPERATION_STARTED';
 const TEMPLATE_OPERATION_COMPLETED = 'EQUIPMENT_OPERATION_COMPLETED';
@@ -113,7 +114,7 @@ async function enqueueRequestActionNotifications(
       await queueTemplateEmails(
         trx,
         clientApprovers.map((recipient) => ({
-          templateCode: TEMPLATE_STATUS_CHANGED,
+          templateCode: TEMPLATE_FINAL_DECISION,
           moduleCode: MODULE_CODE,
           referenceId: equipmentRequest.id,
           referenceUuid: equipmentRequest.uuid,
@@ -187,7 +188,7 @@ async function enqueueAssignmentNotifications(
     assignmentCount: assignments.length,
     assignmentDetailsText,
     assignmentDetailsHtml: escapeHtml(assignmentDetailsText).replace(/\n/g, '<br>'),
-    requestUrl: buildFrontendUrl('/equipment-request/assignments'),
+    requestUrl: buildFrontendUrl('/equipment-request/requests'),
   });
 
   await queueTemplateEmails(
@@ -274,7 +275,7 @@ async function enqueueOperationStartedNotifications(
     operationDetailsText,
     operationDetailsHtml: escapeHtml(operationDetailsText).replace(/\n/g, '<br>'),
 
-    requestUrl: buildFrontendUrl('/equipment-request/assignments'),
+    requestUrl: buildFrontendUrl('/equipment-request/requests'),
   });
 
   await queueTemplateEmails(
@@ -365,7 +366,7 @@ async function enqueueOperationCompletedNotifications(
     completionDetailsText,
     completionDetailsHtml,
 
-    requestUrl: buildFrontendUrl('/equipment-request/assignments'),
+    requestUrl: buildFrontendUrl('/equipment-request/requests'),
   });
 
   await queueTemplateEmails(
@@ -827,6 +828,14 @@ function buildFallbackTemplate(templateCode, payload) {
     };
   }
 
+  if (templateCode === TEMPLATE_FINAL_DECISION) {
+    return {
+      subject: `Final decision: ${payload.requestNo} is ${payload.statusName}`,
+      html: `<!doctype html><html><body><p>Halo {{recipientName}},</p><p>Equipment request <strong>{{requestNo}}</strong> yang sebelumnya Anda review telah mendapat keputusan final dari Global Trans.</p><p>Status akhir: <strong>{{statusName}}</strong></p><p>Action: {{actionName}}</p><p>Processed By: {{actorName}}</p><p>Periode: {{startDate}} sampai {{endDate}}</p><p>Email ini bersifat informasional dan tidak memerlukan tindakan lanjutan dari Anda.</p></body></html>`,
+      text: `Halo {{recipientName}}, equipment request {{requestNo}} yang sebelumnya Anda review telah mendapat keputusan final dari Global Trans. Status akhir: {{statusName}}. Action: {{actionName}}. Processed By: {{actorName}}. Periode: {{startDate}} sampai {{endDate}}. Email ini bersifat informasional dan tidak memerlukan tindakan lanjutan dari Anda.`,
+    };
+  }
+
   if (templateCode === TEMPLATE_ASSIGNED) {
     return {
       subject: `Equipment assigned: ${payload.requestNo}`,
@@ -855,7 +864,7 @@ function buildFallbackTemplate(templateCode, payload) {
 
     <p>
       <a href="{{requestUrl}}">
-        Buka halaman assignment
+        Buka halaman request
       </a>
     </p>
   </body>
@@ -872,7 +881,7 @@ Planned Period: {{startDate}} sampai {{endDate}}
 Equipment Assignment:
 {{assignmentDetailsText}}
 
-Buka halaman assignment:
+Buka halaman request:
 {{requestUrl}}`,
     };
   }
@@ -906,7 +915,7 @@ Buka halaman assignment:
 
     <p>
       <a href="{{requestUrl}}">
-        Buka halaman assignment
+        Buka halaman request
       </a>
     </p>
   </body>
@@ -924,7 +933,7 @@ Started By: {{actorName}}
 Detail Operation:
 {{operationDetailsText}}
 
-Buka halaman assignment:
+Buka halaman request:
 {{requestUrl}}`,
     };
   }
@@ -960,7 +969,7 @@ Buka halaman assignment:
 
     <p>
       <a href="{{requestUrl}}">
-        Buka halaman assignment
+        Buka halaman request
       </a>
     </p>
   </body>
@@ -980,7 +989,7 @@ Overall SLA: {{overallSlaStatus}}
 Completion Detail:
 {{completionDetailsText}}
 
-Buka halaman assignment:
+Buka halaman request:
 {{requestUrl}}`,
     };
   }
