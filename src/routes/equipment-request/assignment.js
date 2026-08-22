@@ -15,6 +15,9 @@ const {
   enqueueOperationStartedNotifications,
   enqueueOperationCompletedNotifications,
 } = require('../../services/equipment-request/email');
+const {
+  deactivateAssignmentMenuNotifications,
+} = require('../../services/equipment-request/notification');
 
 const HOLDER_COMPANY_TYPE = 1;
 
@@ -1213,6 +1216,8 @@ router.post('/:uuid', authorization('EQUIPMENT_REQUEST.ASSIGN'), async (req, res
     });
 
     if (assignmentStatusResult.statusChanged) {
+      await deactivateAssignmentMenuNotifications(trx, equipmentRequest);
+
       await enqueueAssignmentNotifications(trx, {
         requestId: equipmentRequest.id,
         actionUserId: access.user.id,
@@ -1451,6 +1456,8 @@ router.post('/:uuid/bulk', authorization('EQUIPMENT_REQUEST.ASSIGN'), async (req
     );
 
     if (assignmentStatusResult.statusChanged) {
+      await deactivateAssignmentMenuNotifications(trx, equipmentRequest);
+
       await enqueueAssignmentNotifications(trx, {
         requestId: equipmentRequest.id,
         actionUserId: access.user.id,
