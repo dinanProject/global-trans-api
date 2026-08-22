@@ -5,9 +5,26 @@ const express = require('express');
 const router = express.Router();
 const db = require('../lib/db')();
 const { authenticate: authentication } = require('../modules/access/access.middleware');
-const { markReferenceAsRead } = require('../services/menu-notification');
+const { getUnreadMenuCounts, markReferenceAsRead } = require('../services/menu-notification');
 
 router.use(authentication);
+
+router.get('/unread-counts', async function (req, res, next) {
+  try {
+    const access = req.getAccess();
+    const recipientUserId = access?.user?.id;
+
+    if (!recipientUserId) {
+      return res.unauthenticated('User access information was not found.');
+    }
+
+    const unreadCounts = await getUnreadMenuCounts(db, recipientUserId);
+
+    return res.success(Object.fromEntries(unreadCounts));
+  } catch (error) {
+    return next(error);
+  }
+});
 
 router.post('/reference/:referenceUuid/read', async function (req, res, next) {
   const trx = await db.transaction();
