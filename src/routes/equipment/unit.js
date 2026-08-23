@@ -1,7 +1,16 @@
 'use strict';
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const { randomUUID } = require('crypto');
+
+let multer;
+try {
+  multer = require('multer');
+} catch (_) {
+  multer = null;
+}
 
 const router = express.Router();
 
@@ -11,22 +20,42 @@ const {
 } = require('../../modules/access/access.middleware');
 const db = require('../../lib/db')();
 
+const EQUIPMENT_UNIT_IMAGE_MODULE = 'EQUIPMENT_UNIT';
+const EQUIPMENT_UNIT_IMAGE_DOCUMENT_TYPE = 'UNIT_IMAGE';
+const EQUIPMENT_UNIT_CONSUMER_PERMISSIONS = [
+  'EQUIPMENT_UNIT.VIEW',
+  'EQUIPMENT_REQUEST.VIEW',
+  'EQUIPMENT_REQUEST.CREATE',
+  'EQUIPMENT_REQUEST.UPDATE',
+];
+const EQUIPMENT_UNIT_IMAGE_MAX_BYTES = Number(
+  process.env.EQUIPMENT_UNIT_IMAGE_MAX_BYTES || 5 * 1024 * 1024
+);
+const uploadRoot = path.resolve(
+  process.env.FILE_UPLOAD_ROOT || path.join(process.cwd(), 'uploads')
+);
+const equipmentUnitImageRoot = path.join(uploadRoot, 'equipment-units');
+
+fs.mkdirSync(equipmentUnitImageRoot, { recursive: true });
+
+const equipmentUnitImageUpload = multer
+  ? multer({
+      dest: equipmentUnitImageRoot,
+      limits: {
+        fileSize: EQUIPMENT_UNIT_IMAGE_MAX_BYTES,
+        files: 1,
+      },
+    })
+  : null;
+
 router.use(authentication);
 
 router
   .get(
     '/',
-    authorization(
-      [
-        'EQUIPMENT_UNIT.VIEW',
-        'EQUIPMENT_REQUEST.VIEW',
-        'EQUIPMENT_REQUEST.CREATE',
-        'EQUIPMENT_REQUEST.UPDATE',
-      ],
-      {
-        requireAll: false,
-      }
-    ),
+    authorization(EQUIPMENT_UNIT_CONSUMER_PERMISSIONS, {
+      requireAll: false,
+    }),
     async (req, res) => {
       try {
         const { search, categoryUuid, isActive, operationalStatusCode } = req.query;
@@ -361,6 +390,208 @@ router
     }
   })
 
+  .get(
+    '/:uuid/image',
+    authorization(EQUIPMENT_UNIT_CONSUMER_PERMISSIONS, {
+      requireAll: false,
+    }),
+    async (req, res) => {
+      try {
+        const unit = await db('equipmentUnits')
+          .where('uuid', req.params.uuid)
+          .whereNull('deletedAt')
+          .first(['id', 'uuid']);
+
+        if (!unit) {
+          return res.incomplete('Equipment unit tidak ditemukan.');
+        }
+
+        const image = await findActiveEquipmentUnitImage(db, unit.uuid);
+
+        if (!image || !image.filePath || !fs.existsSync(image.filePath)) {
+          return res.status(404).end();
+        }
+
+        res.set('Content-Type', image.mimeType || 'application/octet-stream');
+        res.set(
+          'Content-Disposition',
+          `inline; filename="${sanitizeDownloadName(image.originalName)}"`
+        );
+        res.set('Cache-Control', 'private, max-age=300');
+
+        return res.sendFile(path.resolve(image.filePath));
+      } catch (error) {
+        console.error('GET /equipment-unit/:uuid/image error:', error);
+
+        return res.fail(error.message || 'Failed to load equipment unit image.');
+      }
+    }
+  )
+
+  .post(
+    '/:uuid/image',
+    authorization('EQUIPMENT_UNIT.UPDATE'),
+    handleEquipmentUnitImageUpload,
+    async (req, res) => {
+      const trx = await db.transaction();
+      let previousImages = [];
+
+      try {
+        const unit = await trx('equipmentUnits')
+          .where('uuid', req.params.uuid)
+          .whereNull('deletedAt')
+          .first(['id', 'uuid']);
+
+        if (!unit) {
+          await trx.rollback();
+          removeFileIfExists(req.file?.path);
+
+          return res.incomplete('Equipment unit tidak ditemukan.');
+        }
+
+        if (!req.file) {
+          await trx.rollback();
+
+          return res.incomplete('Gambar equipment unit wajib dipilih.');
+        }
+
+        const detectedImage = detectImageType(req.file.path);
+        const validationMessage = validateEquipmentUnitImage(req.file, detectedImage);
+
+        if (validationMessage) {
+          await trx.rollback();
+          removeFileIfExists(req.file.path);
+
+          return res.incomplete(validationMessage);
+        }
+
+        previousImages = await trx('fileAttachments')
+          .where({
+            moduleCode: EQUIPMENT_UNIT_IMAGE_MODULE,
+            referenceUuid: unit.uuid,
+            documentType: EQUIPMENT_UNIT_IMAGE_DOCUMENT_TYPE,
+            isActive: true,
+          })
+          .whereNull('deletedAt')
+          .select(['uuid', 'filePath']);
+
+        const now = db.fn.now();
+        const imageUuid = randomUUID();
+        const access = req.getData().access;
+
+        if (previousImages.length > 0) {
+          await trx('fileAttachments')
+            .whereIn(
+              'uuid',
+              previousImages.map((image) => image.uuid)
+            )
+            .update({
+              isActive: false,
+              deletedAt: now,
+              updatedAt: now,
+            });
+        }
+
+        await trx('fileAttachments').insert({
+          uuid: imageUuid,
+          moduleCode: EQUIPMENT_UNIT_IMAGE_MODULE,
+          referenceId: unit.id,
+          referenceUuid: unit.uuid,
+          documentType: EQUIPMENT_UNIT_IMAGE_DOCUMENT_TYPE,
+          originalName: req.file.originalname,
+          storedName: req.file.filename,
+          filePath: req.file.path,
+          mimeType: detectedImage.mimeType,
+          fileSize: req.file.size,
+          description: null,
+          uploadedBy: access.user.id,
+          uploadedAt: now,
+          isActive: true,
+          createdAt: now,
+          updatedAt: now,
+          deletedAt: null,
+        });
+
+        await trx.commit();
+
+        previousImages.forEach((image) => removeFileIfExists(image.filePath));
+
+        return res.success({
+          uuid: imageUuid,
+          referenceUuid: unit.uuid,
+          originalName: req.file.originalname,
+          mimeType: detectedImage.mimeType,
+          fileSize: req.file.size,
+        });
+      } catch (error) {
+        await rollbackTransaction(trx);
+        removeFileIfExists(req.file?.path);
+
+        console.error('POST /equipment-unit/:uuid/image error:', error);
+
+        return res.fail(error.message || 'Failed to upload equipment unit image.');
+      }
+    }
+  )
+
+  .delete('/:uuid/image', authorization('EQUIPMENT_UNIT.UPDATE'), async (req, res) => {
+    const trx = await db.transaction();
+
+    try {
+      const unit = await trx('equipmentUnits')
+        .where('uuid', req.params.uuid)
+        .whereNull('deletedAt')
+        .first(['id', 'uuid']);
+
+      if (!unit) {
+        await trx.rollback();
+
+        return res.incomplete('Equipment unit tidak ditemukan.');
+      }
+
+      const images = await trx('fileAttachments')
+        .where({
+          moduleCode: EQUIPMENT_UNIT_IMAGE_MODULE,
+          referenceUuid: unit.uuid,
+          documentType: EQUIPMENT_UNIT_IMAGE_DOCUMENT_TYPE,
+          isActive: true,
+        })
+        .whereNull('deletedAt')
+        .select(['uuid', 'filePath']);
+
+      if (images.length === 0) {
+        await trx.rollback();
+
+        return res.success({ uuid: unit.uuid });
+      }
+
+      const now = db.fn.now();
+
+      await trx('fileAttachments')
+        .whereIn(
+          'uuid',
+          images.map((image) => image.uuid)
+        )
+        .update({
+          isActive: false,
+          deletedAt: now,
+          updatedAt: now,
+        });
+
+      await trx.commit();
+
+      images.forEach((image) => removeFileIfExists(image.filePath));
+
+      return res.success({ uuid: unit.uuid });
+    } catch (error) {
+      await rollbackTransaction(trx);
+
+      console.error('DELETE /equipment-unit/:uuid/image error:', error);
+
+      return res.fail(error.message || 'Failed to delete equipment unit image.');
+    }
+  })
+
   /**
    * DELETE /equipment-unit/:uuid
    *
@@ -409,6 +640,13 @@ router
 function createEquipmentUnitQuery(database = db) {
   return database('equipmentUnits as unit')
     .leftJoin('equipmentCategories as category', 'category.id', 'unit.categoryId')
+    .leftJoin('fileAttachments as unitImage', function () {
+      this.on('unitImage.referenceUuid', '=', 'unit.uuid')
+        .andOnVal('unitImage.moduleCode', '=', EQUIPMENT_UNIT_IMAGE_MODULE)
+        .andOnVal('unitImage.documentType', '=', EQUIPMENT_UNIT_IMAGE_DOCUMENT_TYPE)
+        .andOnVal('unitImage.isActive', '=', 1)
+        .andOnNull('unitImage.deletedAt');
+    })
     .leftJoin('sysLookups as capacityLookup', function () {
       this.on('capacityLookup.lookupCode', '=', 'unit.capacityUnit')
         .andOnVal('capacityLookup.lookupGroup', '=', 'equipment_capacity_unit')
@@ -442,6 +680,11 @@ function createEquipmentUnitQuery(database = db) {
       'operationalStatusLookup.lookupValue as operationalStatusName',
       'operationalStatusLookup.lookupAlias as operationalStatusAlias',
       'unit.remarks',
+      'unitImage.uuid as imageUuid',
+      'unitImage.originalName as imageOriginalName',
+      'unitImage.mimeType as imageMimeType',
+      'unitImage.fileSize as imageFileSize',
+      'unitImage.updatedAt as imageUpdatedAt',
       'unit.isActive',
       'unit.createdAt',
       'unit.updatedAt',
@@ -469,6 +712,125 @@ async function findOperationalStatusLookup(database, operationalStatusCode) {
     .where('isActive', 1)
     .whereNull('deletedAt')
     .first(['lookupId', 'lookupCode', 'lookupValue', 'lookupAlias']);
+}
+
+async function findActiveEquipmentUnitImage(database, unitUuid) {
+  return database('fileAttachments')
+    .where({
+      moduleCode: EQUIPMENT_UNIT_IMAGE_MODULE,
+      referenceUuid: unitUuid,
+      documentType: EQUIPMENT_UNIT_IMAGE_DOCUMENT_TYPE,
+      isActive: true,
+    })
+    .whereNull('deletedAt')
+    .orderBy('createdAt', 'desc')
+    .first();
+}
+
+function handleEquipmentUnitImageUpload(req, res, next) {
+  if (!equipmentUnitImageUpload) {
+    return res.fail('Dependency multer belum terpasang. Jalankan: npm install multer');
+  }
+
+  return equipmentUnitImageUpload.single('image')(req, res, (error) => {
+    if (!error) {
+      return next();
+    }
+
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.incomplete(
+        `Ukuran gambar maksimal ${Math.round(EQUIPMENT_UNIT_IMAGE_MAX_BYTES / 1024 / 1024)} MB.`
+      );
+    }
+
+    return res.incomplete(error.message || 'Gagal membaca file gambar.');
+  });
+}
+
+function detectImageType(filePath) {
+  const descriptor = fs.openSync(filePath, 'r');
+
+  try {
+    const buffer = Buffer.alloc(12);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+
+    if (bytesRead >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+      return {
+        extension: 'jpg',
+        mimeType: 'image/jpeg',
+      };
+    }
+
+    if (
+      bytesRead >= 8 &&
+      buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    ) {
+      return {
+        extension: 'png',
+        mimeType: 'image/png',
+      };
+    }
+
+    if (
+      bytesRead >= 12 &&
+      buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      buffer.subarray(8, 12).toString('ascii') === 'WEBP'
+    ) {
+      return {
+        extension: 'webp',
+        mimeType: 'image/webp',
+      };
+    }
+
+    return null;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function validateEquipmentUnitImage(file, detectedImage) {
+  if (!detectedImage) {
+    return 'Format gambar tidak valid. Gunakan JPG, PNG, atau WEBP.';
+  }
+
+  const extension = path
+    .extname(file.originalname || '')
+    .replace('.', '')
+    .toLowerCase();
+  const allowedExtensions =
+    detectedImage.extension === 'jpg' ? ['jpg', 'jpeg'] : [detectedImage.extension];
+
+  if (!allowedExtensions.includes(extension)) {
+    return 'Extension file tidak sesuai dengan isi gambar.';
+  }
+
+  const normalizedMimeType = String(file.mimetype || '').toLowerCase();
+
+  if (normalizedMimeType !== detectedImage.mimeType) {
+    return 'MIME type file tidak sesuai dengan isi gambar.';
+  }
+
+  return null;
+}
+
+function removeFileIfExists(filePath) {
+  if (!filePath) {
+    return;
+  }
+
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch (error) {
+    console.error('Failed to remove equipment unit image file:', error);
+  }
+}
+
+function sanitizeDownloadName(fileName) {
+  return String(fileName || 'equipment-unit-image')
+    .replace(/[\\/\r\n"]/g, '_')
+    .trim();
 }
 
 function normalizePayload(payload = {}) {
