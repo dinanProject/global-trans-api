@@ -5,10 +5,7 @@ const { randomUUID } = require('crypto');
 
 const router = express.Router();
 
-const {
-  authenticate: authentication,
-  authorize: authorization,
-} = require('../../modules/access/access.middleware');
+const { authenticate: authentication, authorize: authorization } = require('../../modules/access/access.middleware');
 const db = require('../../lib/db')();
 
 const HOLDER_COMPANY_TYPE = 1;
@@ -30,9 +27,7 @@ async function findRequestByUuid(uuid, access, trx = db) {
       this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
     })
     .leftJoin('equipmentRequestStatuses as requestStatus', function () {
-      this.on('requestStatus.code', '=', 'request.status')
-        .andOnVal('requestStatus.isActive', '=', 1)
-        .andOnNull('requestStatus.deletedAt');
+      this.on('requestStatus.code', '=', 'request.status').andOnVal('requestStatus.isActive', '=', 1).andOnNull('requestStatus.deletedAt');
     })
     .select([
       'request.id',
@@ -77,15 +72,9 @@ async function findRequestByUuid(uuid, access, trx = db) {
 async function findRequestForUpdate(trx, uuid, access) {
   const query = trx('equipmentRequests as request')
     .leftJoin('equipmentRequestStatuses as requestStatus', function () {
-      this.on('requestStatus.code', '=', 'request.status')
-        .andOnVal('requestStatus.isActive', '=', 1)
-        .andOnNull('requestStatus.deletedAt');
+      this.on('requestStatus.code', '=', 'request.status').andOnVal('requestStatus.isActive', '=', 1).andOnNull('requestStatus.deletedAt');
     })
-    .select([
-      'request.*',
-      'requestStatus.allowEdit as statusAllowEdit',
-      'requestStatus.isTerminal as statusIsTerminal',
-    ])
+    .select(['request.*', 'requestStatus.allowEdit as statusAllowEdit', 'requestStatus.isTerminal as statusIsTerminal'])
     .where('request.uuid', uuid)
     .whereNull('request.deletedAt')
     .forUpdate();
@@ -192,9 +181,7 @@ async function findRequestHistories(requestId, trx = db) {
 async function findAvailableActions(statusCode, access, trx = db) {
   const transitions = await trx('equipmentRequestStatusTransitions as transition')
     .join('equipmentRequestStatuses as destinationStatus', function () {
-      this.on('destinationStatus.code', '=', 'transition.toStatusCode')
-        .andOnVal('destinationStatus.isActive', '=', 1)
-        .andOnNull('destinationStatus.deletedAt');
+      this.on('destinationStatus.code', '=', 'transition.toStatusCode').andOnVal('destinationStatus.isActive', '=', 1).andOnNull('destinationStatus.deletedAt');
     })
     .select([
       'transition.uuid',
@@ -217,10 +204,7 @@ async function findAvailableActions(statusCode, access, trx = db) {
     .orderBy('transition.sortOrder', 'asc');
 
   return transitions
-    .filter(
-      (transition) =>
-        !transition.permissionCode || access.permissionCodes.includes(transition.permissionCode)
-    )
+    .filter((transition) => !transition.permissionCode || access.permissionCodes.includes(transition.permissionCode))
     .map((transition) => ({
       ...transition,
       requiresRemarks: Boolean(transition.requiresRemarks),
@@ -268,10 +252,7 @@ function buildActionHistoryDescription({ transition, remarks, reviewSchedule }) 
     return remarks ? `${scheduleText} Catatan: ${remarks}` : scheduleText;
   }
 
-  return (
-    remarks ||
-    `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`
-  );
+  return remarks || `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`;
 }
 
 function normalizePayload(payload = {}) {
@@ -369,11 +350,7 @@ function validatePayload(payload) {
 async function validateDetails(trx, details, requestId = null) {
   const categoryIds = [...new Set(details.map((detail) => detail.equipmentCategoryId))];
 
-  const categories = await trx('equipmentCategories')
-    .whereIn('id', categoryIds)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .select('id');
+  const categories = await trx('equipmentCategories').whereIn('id', categoryIds).where('isActive', true).whereNull('deletedAt').select('id');
 
   if (categories.length !== categoryIds.length) {
     return {
@@ -424,11 +401,7 @@ async function resolveCompanyId(trx, companyUuid, access, existingCompanyId = nu
     return null;
   }
 
-  const company = await trx('companies')
-    .where('uuid', companyUuid)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .first('id');
+  const company = await trx('companies').where('uuid', companyUuid).where('isActive', true).whereNull('deletedAt').first('id');
 
   return company?.id || null;
 }
@@ -438,12 +411,7 @@ async function resolveDivisionId(trx, divisionUuid, companyId) {
     return null;
   }
 
-  const division = await trx('divisions')
-    .where('uuid', divisionUuid)
-    .where('companyId', companyId)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .first('id');
+  const division = await trx('divisions').where('uuid', divisionUuid).where('companyId', companyId).where('isActive', true).whereNull('deletedAt').first('id');
 
   return division?.id || null;
 }
@@ -467,10 +435,7 @@ async function insertRequestDetails(trx, requestId, details, now) {
 }
 
 async function synchronizeRequestDetails(trx, requestId, details, now) {
-  const existingDetails = await trx('equipmentRequestDetails')
-    .where('requestId', requestId)
-    .whereNull('deletedAt')
-    .select(['id', 'uuid']);
+  const existingDetails = await trx('equipmentRequestDetails').where('requestId', requestId).whereNull('deletedAt').select(['id', 'uuid']);
 
   const existingByUuid = new Map(existingDetails.map((detail) => [detail.uuid, detail]));
 
@@ -512,10 +477,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
   if (removedDetails.length > 0) {
     const removedDetailIds = removedDetails.map((detail) => detail.id);
 
-    const existingAssignment = await trx('equipmentAssignments')
-      .whereIn('requestDetailId', removedDetailIds)
-      .whereNull('deletedAt')
-      .first('id');
+    const existingAssignment = await trx('equipmentOperations').whereIn('requestDetailId', removedDetailIds).whereNull('deletedAt').first('id');
 
     if (existingAssignment) {
       throw new Error('Detail tidak dapat dihapus karena sudah memiliki equipment assignment.');
@@ -534,10 +496,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
 }
 
 async function generateRequestApprovals(trx, equipmentRequest) {
-  const existingApproval = await trx('equipmentRequestApprovals')
-    .where('requestId', equipmentRequest.id)
-    .whereNull('deletedAt')
-    .first('id');
+  const existingApproval = await trx('equipmentRequestApprovals').where('requestId', equipmentRequest.id).whereNull('deletedAt').first('id');
 
   if (existingApproval) {
     return { valid: true };
@@ -546,9 +505,7 @@ async function generateRequestApprovals(trx, equipmentRequest) {
   const flows = await trx('equipmentApprovalFlows as flow')
     .select(['flow.approvalLevel', 'flow.companyId', 'flow.roleId', 'flow.actorStage'])
     .where((builder) => {
-      builder
-        .whereNull('flow.requestCompanyId')
-        .orWhere('flow.requestCompanyId', equipmentRequest.companyId);
+      builder.whereNull('flow.requestCompanyId').orWhere('flow.requestCompanyId', equipmentRequest.companyId);
     })
     .where('flow.isActive', 1)
     .whereNull('flow.deletedAt')
@@ -602,11 +559,7 @@ async function processPendingApproval(trx, { equipmentRequest, transition, acces
     };
   }
 
-  const userRoleIds = await trx('userRoles')
-    .where('userId', access.user.id)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .pluck('roleId');
+  const userRoleIds = await trx('userRoles').where('userId', access.user.id).where('isActive', true).whereNull('deletedAt').pluck('roleId');
 
   if (userRoleIds.length === 0) {
     return {
@@ -716,22 +669,15 @@ async function getRequestAccess(req, trx = db) {
   const requestData = req.getData() || {};
   const rawAccess = requestData.access || {};
   const rawUser = rawAccess.user || requestData.user || {};
-  const userId = Number(
-    rawUser.id || rawUser.userId || rawAccess.userId || requestData.userId || requestData.id
-  );
+  const userId = Number(rawUser.id || rawUser.userId || rawAccess.userId || requestData.userId || requestData.id);
 
   if (!userId) {
     throw new Error('Authenticated user access was not found.');
   }
 
   const existingCompany = rawAccess.company || requestData.company || {};
-  const existingCompanyId = Number(
-    existingCompany.id || existingCompany.companyId || rawAccess.companyId || requestData.companyId
-  );
-  const existingCompanyType =
-    existingCompany.type === null || existingCompany.type === undefined
-      ? null
-      : Number(existingCompany.type);
+  const existingCompanyId = Number(existingCompany.id || existingCompany.companyId || rawAccess.companyId || requestData.companyId);
+  const existingCompanyType = existingCompany.type === null || existingCompany.type === undefined ? null : Number(existingCompany.type);
 
   if (existingCompanyId && existingCompanyType !== null) {
     return {
@@ -782,10 +728,7 @@ async function getRequestAccess(req, trx = db) {
           uuid: userCompany.companyUuid,
           code: userCompany.companyCode,
           name: userCompany.companyName,
-          type:
-            userCompany.companyType === null || userCompany.companyType === undefined
-              ? null
-              : Number(userCompany.companyType),
+          type: userCompany.companyType === null || userCompany.companyType === undefined ? null : Number(userCompany.companyType),
         }
       : null,
     permissionCodes: normalizePermissionCodes(rawAccess),
@@ -830,10 +773,7 @@ function normalizeRequestResult(request) {
     isActive: Boolean(request.isActive),
     statusAllowEdit: Boolean(request.statusAllowEdit),
     statusIsTerminal: Boolean(request.statusIsTerminal),
-    statusSortOrder:
-      request.statusSortOrder === null || request.statusSortOrder === undefined
-        ? null
-        : Number(request.statusSortOrder),
+    statusSortOrder: request.statusSortOrder === null || request.statusSortOrder === undefined ? null : Number(request.statusSortOrder),
   };
 }
 
@@ -922,7 +862,7 @@ function parseBooleanQuery(value) {
 }
 
 async function findAssignments(requestId, trx = db) {
-  return trx('equipmentAssignments as assignment')
+  return trx('equipmentOperations as assignment')
     .join('equipmentRequestDetails as detail', 'detail.id', 'assignment.requestDetailId')
     .join('equipmentUnits as equipmentUnit', 'equipmentUnit.id', 'assignment.equipmentUnitId')
     .leftJoin('users as assignedUser', 'assignedUser.id', 'assignment.assignedBy')
@@ -962,7 +902,7 @@ async function findAssignments(requestId, trx = db) {
 }
 
 async function findAssignmentByUuid(uuid, trx = db) {
-  return trx('equipmentAssignments as assignment')
+  return trx('equipmentOperations as assignment')
     .join('equipmentRequestDetails as detail', 'detail.id', 'assignment.requestDetailId')
     .join('equipmentUnits as equipmentUnit', 'equipmentUnit.id', 'assignment.equipmentUnitId')
     .leftJoin('users as assignedUser', 'assignedUser.id', 'assignment.assignedBy')
@@ -1036,7 +976,7 @@ function validateAssignmentPayload(payload) {
 }
 
 async function validateEquipmentSchedule(trx, payload) {
-  const overlap = await trx('equipmentAssignments')
+  const overlap = await trx('equipmentOperations')
     .where('equipmentUnitId', payload.equipmentUnitId)
     .where('isActive', true)
     .whereNull('deletedAt')
@@ -1056,18 +996,14 @@ async function validateEquipmentSchedule(trx, payload) {
 }
 
 async function synchronizeRequestAssignmentStatus(trx, requestId) {
-  const details = await trx('equipmentRequestDetails')
-    .where('requestId', requestId)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .select(['id']);
+  const details = await trx('equipmentRequestDetails').where('requestId', requestId).where('isActive', true).whereNull('deletedAt').select(['id']);
 
   if (details.length === 0) {
     return;
   }
 
   for (const detail of details) {
-    const assignment = await trx('equipmentAssignments')
+    const assignment = await trx('equipmentOperations')
       .where('requestDetailId', detail.id)
       .where('isActive', true)
       .whereNull('deletedAt')
@@ -1083,7 +1019,7 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
 }
 
 async function synchronizeRequestOperationalStatus(trx, requestId) {
-  const assignments = await trx('equipmentAssignments')
+  const assignments = await trx('equipmentOperations')
     .where('requestId', requestId)
     .where('isActive', true)
     .whereNull('deletedAt')
@@ -1094,9 +1030,7 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
     return;
   }
 
-  const completedCount = assignments.filter(
-    (assignment) => assignment.statusCode === 'COMPLETED'
-  ).length;
+  const completedCount = assignments.filter((assignment) => assignment.statusCode === 'COMPLETED').length;
 
   const hasInOperation = assignments.some((assignment) => assignment.statusCode === 'IN_OPERATION');
 
@@ -1122,11 +1056,7 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
 }
 
 async function updateRequestStatusIfAvailable(trx, requestId, statusCode) {
-  const status = await trx('equipmentRequestStatuses')
-    .where('code', statusCode)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .first('code');
+  const status = await trx('equipmentRequestStatuses').where('code', statusCode).where('isActive', true).whereNull('deletedAt').first('code');
 
   if (!status) {
     return;
@@ -1140,10 +1070,7 @@ async function updateRequestStatusIfAvailable(trx, requestId, statusCode) {
 
 const MONITORING_ASSIGNMENT_STATUS_CODES = ['ASSIGNED', 'IN_OPERATION', 'COMPLETED'];
 
-const MONITORING_TIME_ZONE = (process.env.APP_TIMEZONE || 'Asia/Jakarta').replace(
-  /^["']|["']$/g,
-  ''
-);
+const MONITORING_TIME_ZONE = (process.env.APP_TIMEZONE || 'Asia/Jakarta').replace(/^["']|["']$/g, '');
 
 function normalizeDateOnly(value) {
   if (!value) {
@@ -1197,26 +1124,24 @@ function calculateAssignmentMonitoring(assignment) {
   const actualStartDate = normalizeDateOnly(assignment.actualStartDate);
   const actualEndDate = normalizeDateOnly(assignment.actualEndDate);
 
-  let operationStatus = 'ASSIGNED';
-  let slaStatus = 'ASSIGNED';
+  let operationStatus = 'SCHEDULED';
+  let slaStatus = 'SCHEDULED';
 
   if (actualEndDate) {
     operationStatus = 'COMPLETED';
-    slaStatus =
-      plannedEndDate && actualEndDate <= plannedEndDate ? 'COMPLETED_ON_TIME' : 'COMPLETED_LATE';
+    slaStatus = plannedEndDate && actualEndDate <= plannedEndDate ? 'COMPLETED_ON_TIME' : 'COMPLETED_LATE';
+  } else if (plannedStartDate && today < plannedStartDate) {
+    operationStatus = 'SCHEDULED';
+    slaStatus = 'SCHEDULED';
+  } else if (plannedEndDate && today > plannedEndDate) {
+    operationStatus = 'RUNNING';
+    slaStatus = 'OVERDUE';
+  } else if (plannedStartDate && today >= plannedStartDate) {
+    operationStatus = 'RUNNING';
+    slaStatus = 'ON_SCHEDULE';
   } else if (actualStartDate) {
     operationStatus = 'RUNNING';
-
-    if (plannedEndDate && today > plannedEndDate) {
-      slaStatus = 'OVERDUE';
-    } else if (plannedStartDate && actualStartDate > plannedStartDate) {
-      slaStatus = 'LATE_START';
-    } else {
-      slaStatus = 'ON_TIME_START';
-    }
-  } else if (plannedEndDate && today > plannedEndDate) {
-    operationStatus = 'ASSIGNED';
-    slaStatus = 'OVERDUE';
+    slaStatus = 'ON_SCHEDULE';
   }
 
   return {
@@ -1307,7 +1232,7 @@ function applyMonitoringFilters(query, filters, aliases = {}) {
 }
 
 function buildMonitoringAssignmentQuery(trx = db) {
-  return trx('equipmentAssignments as assignment')
+  return trx('equipmentOperations as assignment')
     .join('equipmentRequests as request', 'request.id', 'assignment.requestId')
     .join('equipmentRequestDetails as detail', 'detail.id', 'assignment.requestDetailId')
     .join('equipmentUnits as equipmentUnit', 'equipmentUnit.id', 'assignment.equipmentUnitId')
@@ -1388,13 +1313,9 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
 
     if (filters.status === 'ACTIVE') {
       query.andWhere((builder) => {
-        builder
-          .whereIn('assignment.statusCode', ['ASSIGNED', 'IN_OPERATION'])
-          .orWhere((completedBuilder) => {
-            completedBuilder
-              .where('assignment.statusCode', 'COMPLETED')
-              .whereRaw('DATE(assignment.actualEndDate) = CURRENT_DATE');
-          });
+        builder.whereIn('assignment.statusCode', ['ASSIGNED', 'IN_OPERATION']).orWhere((completedBuilder) => {
+          completedBuilder.where('assignment.statusCode', 'COMPLETED').whereRaw('DATE(assignment.actualEndDate) = CURRENT_DATE');
+        });
       });
     }
 
@@ -1422,7 +1343,7 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
       .whereNull('equipmentUnit.deletedAt')
       .whereNotExists(function () {
         this.select(db.raw('1'))
-          .from('equipmentAssignments as activeAssignment')
+          .from('equipmentOperations as activeAssignment')
           .whereRaw('activeAssignment.equipmentUnitId = equipmentUnit.id')
           .where('activeAssignment.isActive', true)
           .whereNull('activeAssignment.deletedAt')
@@ -1499,29 +1420,29 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
 
     const summary = {
       activeOperation: 0,
-      assignedWaitingStart: 0,
+      waitingStart: 0,
       overdue: 0,
-      lateStart: 0,
+      onSchedule: 0,
       completedToday: 0,
       availableUnit: Number(availableUnitResult?.total || 0),
       maintenanceUnit: Number(maintenanceUnitResult?.total || 0),
     };
 
     assignments.forEach((assignment) => {
-      if (assignment.actualStartDate && !assignment.actualEndDate) {
+      if (assignment.operationStatus === 'RUNNING') {
         summary.activeOperation += 1;
       }
 
-      if (!assignment.actualStartDate && !assignment.actualEndDate) {
-        summary.assignedWaitingStart += 1;
+      if (assignment.operationStatus === 'SCHEDULED') {
+        summary.waitingStart += 1;
       }
 
       if (assignment.isOverdue) {
         summary.overdue += 1;
       }
 
-      if (assignment.isLateStart) {
-        summary.lateStart += 1;
+      if (assignment.slaStatus === 'ON_SCHEDULE') {
+        summary.onSchedule += 1;
       }
 
       if (assignment.isCompletedToday) {
@@ -1578,9 +1499,9 @@ router.get('/summary', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, r
 
     const summary = {
       activeOperation: 0,
-      assignedWaitingStart: 0,
+      waitingStart: 0,
       overdue: 0,
-      lateStart: 0,
+      onSchedule: 0,
       completedToday: 0,
       availableUnit: 0,
       maintenanceUnit: 0,
@@ -1589,20 +1510,20 @@ router.get('/summary', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, r
     assignments.forEach((assignment) => {
       const monitoring = calculateAssignmentMonitoring(assignment);
 
-      if (assignment.actualStartDate && !assignment.actualEndDate) {
+      if (monitoring.operationStatus === 'RUNNING') {
         summary.activeOperation += 1;
       }
 
-      if (!assignment.actualStartDate && !assignment.actualEndDate) {
-        summary.assignedWaitingStart += 1;
+      if (monitoring.operationStatus === 'SCHEDULED') {
+        summary.waitingStart += 1;
       }
 
       if (monitoring.isOverdue) {
         summary.overdue += 1;
       }
 
-      if (monitoring.isLateStart) {
-        summary.lateStart += 1;
+      if (monitoring.slaStatus === 'ON_SCHEDULE') {
+        summary.onSchedule += 1;
       }
 
       if (monitoring.isCompletedToday) {
@@ -1616,7 +1537,7 @@ router.get('/summary', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, r
       .whereNull('equipmentUnit.deletedAt')
       .whereNotExists(function () {
         this.select(db.raw('1'))
-          .from('equipmentAssignments as activeAssignment')
+          .from('equipmentOperations as activeAssignment')
           .whereRaw('activeAssignment.equipmentUnitId = equipmentUnit.id')
           .where('activeAssignment.isActive', true)
           .whereNull('activeAssignment.deletedAt')
@@ -1642,10 +1563,7 @@ router.get('/summary', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, r
       .count({ total: 'equipmentUnit.id' })
       .first();
 
-    const [availableUnitResult, maintenanceUnitResult] = await Promise.all([
-      availableUnitQuery,
-      maintenanceUnitQuery,
-    ]);
+    const [availableUnitResult, maintenanceUnitResult] = await Promise.all([availableUnitQuery, maintenanceUnitQuery]);
 
     summary.availableUnit = Number(availableUnitResult?.total || 0);
     summary.maintenanceUnit = Number(maintenanceUnitResult?.total || 0);
@@ -1816,7 +1734,7 @@ router.get('/:uuid', authorization('EQUIPMENT_REQUEST.VIEW'), async (req, res) =
     const histories = await findRequestHistories(assignment.requestId);
 
     const approvedHistory = histories.find(
-      (history) => history.activity === 'APPROVE_GTSI' || history.activity === 'APPROVED'
+      (history) => history.activity === 'APPROVE_CLIENT' || history.activity === 'APPROVE_GTSI' || history.activity === 'APPROVED'
     );
 
     const monitoring = calculateAssignmentMonitoring(assignment);
@@ -1840,16 +1758,16 @@ router.get('/:uuid', authorization('EQUIPMENT_REQUEST.VIEW'), async (req, res) =
           date: approvedHistory?.createdAt || null,
         },
         {
-          code: 'ASSIGNED',
-          label: 'Assigned',
-          completed: Boolean(assignment.assignedAt),
-          date: assignment.assignedAt || null,
+          code: 'SCHEDULED',
+          label: 'Scheduled',
+          completed: Boolean(assignment.plannedStartDate),
+          date: assignment.plannedStartDate || null,
         },
         {
-          code: 'STARTED',
-          label: 'Started',
-          completed: Boolean(assignment.actualStartDate),
-          date: assignment.actualStartDate || null,
+          code: 'IN_OPERATION',
+          label: 'In Operation',
+          completed: monitoring.operationStatus === 'RUNNING' || monitoring.operationStatus === 'COMPLETED',
+          date: assignment.actualStartDate || assignment.plannedStartDate || null,
         },
         {
           code: 'COMPLETED',

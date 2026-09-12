@@ -1,24 +1,37 @@
 'use strict';
 
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const { randomUUID } = require('crypto');
+let multer;
+try {
+  multer = require('multer');
+} catch (_) {
+  multer = null;
+}
 
 const router = express.Router();
 
-const {
-  authenticate: authentication,
-  authorize: authorization,
-} = require('../../modules/access/access.middleware');
+const { authenticate: authentication, authorize: authorization } = require('../../modules/access/access.middleware');
 const db = require('../../lib/db')();
 const { enqueueRequestActionNotifications } = require('../../services/equipment-request/email');
-const {
-  enqueueRequestActionMenuNotifications,
-} = require('../../services/equipment-request/notification');
+const { enqueueRequestActionMenuNotifications } = require('../../services/equipment-request/notification');
 
 const HOLDER_COMPANY_TYPE = 1;
 const STATUS_DRAFT = 'DRAFT';
 const ACTION_SUBMIT = 'SUBMIT';
 const SCHEDULE_REVIEW_ACTIONS = new Set(['APPROVE_CLIENT', 'APPROVE_GTSI']);
+const REQUEST_ATTACHMENT_MODULE = 'EQUIPMENT_REQUEST';
+const REQUEST_ATTACHMENT_DOCUMENT_TYPE = 'SUPPORTING_DOCUMENT';
+const REQUEST_ATTACHMENT_READ_PERMISSIONS = ['EQUIPMENT_REQUEST.VIEW', 'EQUIPMENT_APPROVAL.VIEW', 'EQUIPMENT_OPERATION.VIEW', 'EQUIPMENT_MONITORING.VIEW'];
+const REQUEST_ATTACHMENT_MAX_COUNT = Number(process.env.EQUIPMENT_REQUEST_ATTACHMENT_MAX_COUNT || 5);
+const REQUEST_ATTACHMENT_MAX_BYTES = Number(process.env.EQUIPMENT_REQUEST_ATTACHMENT_MAX_BYTES || 10 * 1024 * 1024);
+const REQUEST_ATTACHMENT_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.webp']);
+const REQUEST_ATTACHMENT_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const requestAttachmentRoot = path.resolve(process.env.FILE_UPLOAD_PATH || path.join(process.cwd(), 'uploads'));
+fs.mkdirSync(requestAttachmentRoot, { recursive: true });
+const requestAttachmentUpload = multer ? multer({ dest: requestAttachmentRoot, limits: { fileSize: REQUEST_ATTACHMENT_MAX_BYTES } }) : null;
 
 router.use(authentication);
 
@@ -51,9 +64,7 @@ router
           this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
         })
         .leftJoin('equipmentRequestStatuses as requestStatus', function () {
-          this.on('requestStatus.code', '=', 'request.status')
-            .andOnVal('requestStatus.isActive', '=', 1)
-            .andOnNull('requestStatus.deletedAt');
+          this.on('requestStatus.code', '=', 'request.status').andOnVal('requestStatus.isActive', '=', 1).andOnNull('requestStatus.deletedAt');
         })
         .select([
           'request.id',
@@ -151,6 +162,7 @@ router
       const requestIds = requests.map((item) => item.id);
 
       const detailSummaryByRequestId = new Map();
+      const attachmentCountByRequestUuid = new Map();
 
       if (requestIds.length > 0) {
         const detailSummaryQuery = db('equipmentRequestDetails')
@@ -206,15 +218,31 @@ router
                     equipmentUnitName: detail.equipmentUnitName,
 
                     requiredCapacityValue:
-                      detail.requiredCapacityValue === null ||
-                      detail.requiredCapacityValue === undefined
-                        ? null
-                        : Number(detail.requiredCapacityValue),
+                      detail.requiredCapacityValue === null || detail.requiredCapacityValue === undefined ? null : Number(detail.requiredCapacityValue),
                     requiredCapacityUnit: detail.requiredCapacityUnit,
                   },
                 ]
               : [],
           });
+        }
+      }
+
+      if (requests.length > 0) {
+        const attachmentCounts = await db('fileAttachments')
+          .select('referenceUuid')
+          .count({ attachmentCount: '*' })
+          .where('moduleCode', REQUEST_ATTACHMENT_MODULE)
+          .where('documentType', REQUEST_ATTACHMENT_DOCUMENT_TYPE)
+          .where('isActive', true)
+          .whereNull('deletedAt')
+          .whereIn(
+            'referenceUuid',
+            requests.map((item) => item.uuid)
+          )
+          .groupBy('referenceUuid');
+
+        for (const item of attachmentCounts) {
+          attachmentCountByRequestUuid.set(item.referenceUuid, Number(item.attachmentCount) || 0);
         }
       }
 
@@ -230,6 +258,7 @@ router
           ...normalizeRequestResult(request),
           details: detailSummary?.details ?? [],
           detailCount: detailSummary?.detailCount ?? 0,
+          attachmentCount: attachmentCountByRequestUuid.get(request.uuid) ?? 0,
           availableActions: actionsByStatus.get(request.status) ?? [],
         };
       });
@@ -244,18 +273,7 @@ router
   .get('/request-statuses', async (req, res) => {
     try {
       const statuses = await db('equipmentRequestStatuses')
-        .select(
-          'id',
-          'uuid',
-          'code',
-          'name',
-          'description',
-          'stage',
-          'sortOrder',
-          'allowEdit',
-          'isTerminal',
-          'isActive'
-        )
+        .select('id', 'uuid', 'code', 'name', 'description', 'stage', 'sortOrder', 'allowEdit', 'isTerminal', 'isActive')
         .where('isActive', 1)
         .orderBy('sortOrder', 'asc');
 
@@ -327,18 +345,10 @@ router
       if (payload.divisionUuid && !divisionId) {
         await trx.rollback();
 
-        return res.incomplete(
-          'Division tidak valid, tidak aktif, atau bukan milik company tersebut.'
-        );
+        return res.incomplete('Division tidak valid, tidak aktif, atau bukan milik company tersebut.');
       }
 
-      const detailValidation = await validateDetails(
-        trx,
-        payload.details,
-        null,
-        payload.startDate,
-        payload.endDate
-      );
+      const detailValidation = await validateDetails(trx, payload.details, null, payload.startDate, payload.endDate);
 
       if (!detailValidation.valid) {
         await trx.rollback();
@@ -437,9 +447,7 @@ router
       if (!Boolean(existingRequest.statusAllowEdit)) {
         await trx.rollback();
 
-        return res.incomplete(
-          `Equipment request dengan status ${existingRequest.status} tidak dapat diubah.`
-        );
+        return res.incomplete(`Equipment request dengan status ${existingRequest.status} tidak dapat diubah.`);
       }
 
       const payload = normalizePayload(req.body);
@@ -451,12 +459,7 @@ router
         return res.incomplete(validation.message);
       }
 
-      const companyId = await resolveCompanyId(
-        trx,
-        payload.companyUuid,
-        access,
-        existingRequest.companyId
-      );
+      const companyId = await resolveCompanyId(trx, payload.companyUuid, access, existingRequest.companyId);
 
       if (!companyId) {
         await trx.rollback();
@@ -469,18 +472,10 @@ router
       if (payload.divisionUuid && !divisionId) {
         await trx.rollback();
 
-        return res.incomplete(
-          'Division tidak valid, tidak aktif, atau bukan milik company tersebut.'
-        );
+        return res.incomplete('Division tidak valid, tidak aktif, atau bukan milik company tersebut.');
       }
 
-      const detailValidation = await validateDetails(
-        trx,
-        payload.details,
-        existingRequest.id,
-        payload.startDate,
-        payload.endDate
-      );
+      const detailValidation = await validateDetails(trx, payload.details, existingRequest.id, payload.startDate, payload.endDate);
 
       if (!detailValidation.valid) {
         await trx.rollback();
@@ -560,14 +555,11 @@ router
 
       const now = db.fn.now();
 
-      await trx('equipmentRequestDetails')
-        .where('requestId', equipmentRequest.id)
-        .whereNull('deletedAt')
-        .update({
-          isActive: false,
-          updatedAt: now,
-          deletedAt: now,
-        });
+      await trx('equipmentRequestDetails').where('requestId', equipmentRequest.id).whereNull('deletedAt').update({
+        isActive: false,
+        updatedAt: now,
+        deletedAt: now,
+      });
 
       await trx('equipmentRequests').where('id', equipmentRequest.id).update({
         isActive: false,
@@ -617,14 +609,143 @@ router
     return executeRequestAction(req, res, ACTION_SUBMIT);
   });
 
+router.get('/:uuid/attachments', authorization(REQUEST_ATTACHMENT_READ_PERMISSIONS, { requireAll: false }), async (req, res) => {
+  try {
+    const access = await getRequestAccess(req);
+    const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
+    if (!equipmentRequest) return res.incomplete('Equipment request tidak ditemukan.');
+    const rows = await db('fileAttachments as file')
+      .leftJoin('users as uploader', 'uploader.id', 'file.uploadedBy')
+      .select([
+        'file.uuid',
+        'file.originalName',
+        'file.mimeType',
+        'file.fileSize',
+        'file.description',
+        'file.uploadedAt',
+        'uploader.fullName as uploadedByName',
+      ])
+      .where({
+        'file.moduleCode': REQUEST_ATTACHMENT_MODULE,
+        'file.referenceUuid': equipmentRequest.uuid,
+        'file.documentType': REQUEST_ATTACHMENT_DOCUMENT_TYPE,
+        'file.isActive': true,
+      })
+      .whereNull('file.deletedAt')
+      .orderBy('file.createdAt', 'asc');
+    return res.success(rows);
+  } catch (error) {
+    return res.fail(error.message || 'Failed to load request attachments.');
+  }
+});
+
+router.post(
+  '/:uuid/attachments',
+  authorization(['EQUIPMENT_REQUEST.CREATE', 'EQUIPMENT_REQUEST.UPDATE'], { requireAll: false }),
+  (req, res, next) => {
+    if (!requestAttachmentUpload) return res.fail('Dependency multer belum terpasang. Jalankan: npm install multer');
+    return requestAttachmentUpload.single('file')(req, res, next);
+  },
+  async (req, res) => {
+    const trx = await db.transaction();
+    try {
+      if (!req.file) {
+        await trx.rollback();
+        return res.incomplete('File wajib dipilih.');
+      }
+      const access = await getRequestAccess(req, trx);
+      const equipmentRequest = await findRequestForUpdate(trx, req.params.uuid, access);
+      if (!equipmentRequest) throw new Error('Equipment request tidak ditemukan atau tidak dapat diubah.');
+      if (!equipmentRequest.statusAllowEdit) throw new Error('Attachment hanya dapat diubah saat request masih editable.');
+      const countRow = await trx('fileAttachments')
+        .where({ moduleCode: REQUEST_ATTACHMENT_MODULE, referenceUuid: equipmentRequest.uuid, documentType: REQUEST_ATTACHMENT_DOCUMENT_TYPE, isActive: true })
+        .whereNull('deletedAt')
+        .count({ count: '*' })
+        .first();
+      if (Number(countRow?.count || 0) >= REQUEST_ATTACHMENT_MAX_COUNT) throw new Error(`Maksimal ${REQUEST_ATTACHMENT_MAX_COUNT} attachment per request.`);
+      const validation = validateRequestAttachment(req.file);
+      if (!validation.valid) throw new Error(validation.message);
+      const uuid = randomUUID();
+      const now = db.fn.now();
+      await trx('fileAttachments').insert({
+        uuid,
+        moduleCode: REQUEST_ATTACHMENT_MODULE,
+        referenceId: equipmentRequest.id,
+        referenceUuid: equipmentRequest.uuid,
+        documentType: REQUEST_ATTACHMENT_DOCUMENT_TYPE,
+        originalName: path.basename(req.file.originalname),
+        storedName: req.file.filename,
+        filePath: req.file.path,
+        mimeType: validation.mimeType,
+        fileSize: req.file.size,
+        description: normalizeNullableString(req.body.description),
+        uploadedBy: access.user.id,
+        uploadedAt: now,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: null,
+      });
+      await trx.commit();
+      return res.success(await db('fileAttachments').where('uuid', uuid).first(['uuid', 'originalName', 'mimeType', 'fileSize', 'description', 'uploadedAt']));
+    } catch (error) {
+      await trx.rollback();
+      if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      return res.fail(error.message || 'Failed to upload request attachment.');
+    }
+  }
+);
+
+router.get('/:uuid/attachments/:attachmentUuid/download', authorization(REQUEST_ATTACHMENT_READ_PERMISSIONS, { requireAll: false }), async (req, res) => {
+  try {
+    const access = await getRequestAccess(req);
+    const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
+    if (!equipmentRequest) return res.incomplete('Equipment request tidak ditemukan.');
+    const row = await db('fileAttachments')
+      .where({
+        uuid: req.params.attachmentUuid,
+        moduleCode: REQUEST_ATTACHMENT_MODULE,
+        referenceUuid: equipmentRequest.uuid,
+        documentType: REQUEST_ATTACHMENT_DOCUMENT_TYPE,
+        isActive: true,
+      })
+      .whereNull('deletedAt')
+      .first();
+    if (!row || !fs.existsSync(row.filePath)) return res.incomplete('Attachment tidak ditemukan.');
+    res.type(row.mimeType || 'application/octet-stream');
+    return res.download(row.filePath, row.originalName);
+  } catch (error) {
+    return res.fail(error.message || 'Failed to download request attachment.');
+  }
+});
+
+router.delete('/:uuid/attachments/:attachmentUuid', authorization('EQUIPMENT_REQUEST.UPDATE'), async (req, res) => {
+  try {
+    const access = await getRequestAccess(req);
+    const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
+    if (!equipmentRequest || !equipmentRequest.statusAllowEdit) return res.incomplete('Attachment tidak dapat dihapus pada status request saat ini.');
+    const updated = await db('fileAttachments')
+      .where({
+        uuid: req.params.attachmentUuid,
+        moduleCode: REQUEST_ATTACHMENT_MODULE,
+        referenceUuid: equipmentRequest.uuid,
+        documentType: REQUEST_ATTACHMENT_DOCUMENT_TYPE,
+        isActive: true,
+      })
+      .whereNull('deletedAt')
+      .update({ isActive: false, deletedAt: db.fn.now(), updatedAt: db.fn.now() });
+    return updated ? res.success({ uuid: req.params.attachmentUuid }) : res.incomplete('Attachment tidak ditemukan.');
+  } catch (error) {
+    return res.fail(error.message || 'Failed to delete request attachment.');
+  }
+});
+
 async function executeRequestAction(req, res, forcedActionCode = null) {
   const trx = await db.transaction();
 
   try {
     const access = await getRequestAccess(req);
-    const actionCode = normalizeRequiredString(
-      forcedActionCode || req.body?.actionCode
-    ).toUpperCase();
+    const actionCode = normalizeRequiredString(forcedActionCode || req.body?.actionCode).toUpperCase();
 
     if (!actionCode) {
       await trx.rollback();
@@ -666,9 +787,7 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
     if (!transition) {
       await trx.rollback();
 
-      return res.incomplete(
-        `Transition ${actionCode} tidak tersedia dari status ${equipmentRequest.status}.`
-      );
+      return res.incomplete(`Transition ${actionCode} tidak tersedia dari status ${equipmentRequest.status}.`);
     }
 
     if (transition.permissionCode && !access.permissionCodes.includes(transition.permissionCode)) {
@@ -697,24 +816,13 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       if (activeDetails.length === 0) {
         await trx.rollback();
 
-        return res.incomplete(
-          'Equipment request harus memiliki minimal satu detail sebelum disubmit.'
-        );
+        return res.incomplete('Equipment request harus memiliki minimal satu detail sebelum disubmit.');
       }
 
-      if (
-        activeDetails.some(
-          (detail) =>
-            !detail.equipmentUnitId ||
-            Number(detail.requiredCapacityValue) <= 0 ||
-            !detail.requiredCapacityUnit
-        )
-      ) {
+      if (activeDetails.some((detail) => !detail.equipmentUnitId || Number(detail.requiredCapacityValue) <= 0 || !detail.requiredCapacityUnit)) {
         await trx.rollback();
 
-        return res.incomplete(
-          'Semua detail harus memiliki equipment unit dan kebutuhan kapasitas.'
-        );
+        return res.incomplete('Semua detail harus memiliki equipment unit dan kebutuhan kapasitas.');
       }
 
       const approvalGeneration = await generateRequestApprovals(trx, equipmentRequest);
@@ -833,9 +941,7 @@ async function findRequestByUuid(uuid, access, trx = db) {
       this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
     })
     .leftJoin('equipmentRequestStatuses as requestStatus', function () {
-      this.on('requestStatus.code', '=', 'request.status')
-        .andOnVal('requestStatus.isActive', '=', 1)
-        .andOnNull('requestStatus.deletedAt');
+      this.on('requestStatus.code', '=', 'request.status').andOnVal('requestStatus.isActive', '=', 1).andOnNull('requestStatus.deletedAt');
     })
     .select([
       'request.id',
@@ -880,15 +986,9 @@ async function findRequestByUuid(uuid, access, trx = db) {
 async function findRequestForUpdate(trx, uuid, access) {
   const query = trx('equipmentRequests as request')
     .leftJoin('equipmentRequestStatuses as requestStatus', function () {
-      this.on('requestStatus.code', '=', 'request.status')
-        .andOnVal('requestStatus.isActive', '=', 1)
-        .andOnNull('requestStatus.deletedAt');
+      this.on('requestStatus.code', '=', 'request.status').andOnVal('requestStatus.isActive', '=', 1).andOnNull('requestStatus.deletedAt');
     })
-    .select([
-      'request.*',
-      'requestStatus.allowEdit as statusAllowEdit',
-      'requestStatus.isTerminal as statusIsTerminal',
-    ])
+    .select(['request.*', 'requestStatus.allowEdit as statusAllowEdit', 'requestStatus.isTerminal as statusIsTerminal'])
     .where('request.uuid', uuid)
     .whereNull('request.deletedAt')
     .forUpdate();
@@ -904,9 +1004,7 @@ async function findRequestDetails(requestId, trx = db) {
       this.on('category.id', '=', 'detail.equipmentCategoryId').andOnNull('category.deletedAt');
     })
     .leftJoin('equipmentUnits as equipmentUnit', function () {
-      this.on('equipmentUnit.id', '=', 'detail.equipmentUnitId').andOnNull(
-        'equipmentUnit.deletedAt'
-      );
+      this.on('equipmentUnit.id', '=', 'detail.equipmentUnitId').andOnNull('equipmentUnit.deletedAt');
     })
     .select([
       'detail.id',
@@ -940,10 +1038,8 @@ async function findRequestDetails(requestId, trx = db) {
 
   return details.map((detail) => ({
     ...detail,
-    requiredCapacityValue:
-      detail.requiredCapacityValue === null ? null : Number(detail.requiredCapacityValue),
-    equipmentUnitCapacityValue:
-      detail.equipmentUnitCapacityValue === null ? null : Number(detail.equipmentUnitCapacityValue),
+    requiredCapacityValue: detail.requiredCapacityValue === null ? null : Number(detail.requiredCapacityValue),
+    equipmentUnitCapacityValue: detail.equipmentUnitCapacityValue === null ? null : Number(detail.equipmentUnitCapacityValue),
     rate: detail.rate === null ? null : Number(detail.rate),
     isActive: Boolean(detail.isActive),
   }));
@@ -1027,9 +1123,7 @@ async function findAvailableActionsByStatuses(statusCodes, access, trx = db) {
 
   const transitions = await trx('equipmentRequestStatusTransitions as transition')
     .join('equipmentRequestStatuses as destinationStatus', function () {
-      this.on('destinationStatus.code', '=', 'transition.toStatusCode')
-        .andOnVal('destinationStatus.isActive', '=', 1)
-        .andOnNull('destinationStatus.deletedAt');
+      this.on('destinationStatus.code', '=', 'transition.toStatusCode').andOnVal('destinationStatus.isActive', '=', 1).andOnNull('destinationStatus.deletedAt');
     })
     .select([
       'transition.uuid',
@@ -1079,9 +1173,7 @@ async function findAvailableActionsByStatuses(statusCodes, access, trx = db) {
 async function findAvailableActions(statusCode, access, trx = db) {
   const transitions = await trx('equipmentRequestStatusTransitions as transition')
     .join('equipmentRequestStatuses as destinationStatus', function () {
-      this.on('destinationStatus.code', '=', 'transition.toStatusCode')
-        .andOnVal('destinationStatus.isActive', '=', 1)
-        .andOnNull('destinationStatus.deletedAt');
+      this.on('destinationStatus.code', '=', 'transition.toStatusCode').andOnVal('destinationStatus.isActive', '=', 1).andOnNull('destinationStatus.deletedAt');
     })
     .select([
       'transition.uuid',
@@ -1104,10 +1196,7 @@ async function findAvailableActions(statusCode, access, trx = db) {
     .orderBy('transition.sortOrder', 'asc');
 
   return transitions
-    .filter(
-      (transition) =>
-        !transition.permissionCode || access.permissionCodes.includes(transition.permissionCode)
-    )
+    .filter((transition) => !transition.permissionCode || access.permissionCodes.includes(transition.permissionCode))
     .map((transition) => ({
       ...transition,
       requiresRemarks: Boolean(transition.requiresRemarks),
@@ -1150,16 +1239,12 @@ function normalizeReviewSchedulePayload(payload = {}) {
 
 function buildActionHistoryDescription({ transition, remarks, reviewSchedule, scheduleUpdated }) {
   if (scheduleUpdated && reviewSchedule?.valid) {
-    const scheduleText =
-      `Jadwal direview menjadi ${reviewSchedule.startDate} ` + `sampai ${reviewSchedule.endDate}.`;
+    const scheduleText = `Jadwal direview menjadi ${reviewSchedule.startDate} ` + `sampai ${reviewSchedule.endDate}.`;
 
     return remarks ? `${scheduleText} Catatan: ${remarks}` : scheduleText;
   }
 
-  return (
-    remarks ||
-    `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`
-  );
+  return remarks || `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`;
 }
 
 function normalizePayload(payload = {}) {
@@ -1280,16 +1365,9 @@ function validatePayload(payload) {
   };
 }
 
-async function validateEquipmentUnitAvailability(
-  trx,
-  { equipmentUnitId, requestId = null, startDate, endDate }
-) {
-  const query = trx('equipmentAssignments as assignment')
-    .leftJoin(
-      'equipmentRequestDetails as requestDetail',
-      'requestDetail.id',
-      'assignment.requestDetailId'
-    )
+async function validateEquipmentUnitAvailability(trx, { equipmentUnitId, requestId = null, startDate, endDate }) {
+  const query = trx('equipmentOperations as assignment')
+    .leftJoin('equipmentRequestDetails as requestDetail', 'requestDetail.id', 'assignment.requestDetailId')
     .where('assignment.equipmentUnitId', equipmentUnitId)
     .where('assignment.isActive', true)
     .whereNull('assignment.deletedAt')
@@ -1337,8 +1415,7 @@ async function validateEquipmentUnitAvailability(
   const plannedEndDate = new Date(overlap.plannedEndDate);
   const actualEndDate = new Date(overlap.actualEndDate);
 
-  const availableAt =
-    actualEndDate > plannedEndDate ? overlap.actualEndDate : overlap.plannedEndDate;
+  const availableAt = actualEndDate > plannedEndDate ? overlap.actualEndDate : overlap.plannedEndDate;
 
   return {
     valid: false,
@@ -1349,11 +1426,7 @@ async function validateEquipmentUnitAvailability(
 async function validateDetails(trx, details, requestId = null, startDate = null, endDate = null) {
   const categoryIds = [...new Set(details.map((detail) => detail.equipmentCategoryId))];
 
-  const categories = await trx('equipmentCategories')
-    .whereIn('id', categoryIds)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .select('id');
+  const categories = await trx('equipmentCategories').whereIn('id', categoryIds).where('isActive', true).whereNull('deletedAt').select('id');
 
   if (categories.length !== categoryIds.length) {
     return {
@@ -1391,9 +1464,7 @@ async function validateDetails(trx, details, requestId = null, startDate = null,
     };
   }
 
-  const requiredCapacityUnits = [
-    ...new Set(details.map((detail) => detail.requiredCapacityUnit).filter(Boolean)),
-  ];
+  const requiredCapacityUnits = [...new Set(details.map((detail) => detail.requiredCapacityUnit).filter(Boolean))];
 
   const capacityUnitLookups = await trx('sysLookups')
     .where('lookupGroup', 'equipment_capacity_unit')
@@ -1409,9 +1480,7 @@ async function validateDetails(trx, details, requestId = null, startDate = null,
     };
   }
 
-  const equipmentUnitById = new Map(
-    equipmentUnits.map((equipmentUnit) => [Number(equipmentUnit.id), equipmentUnit])
-  );
+  const equipmentUnitById = new Map(equipmentUnits.map((equipmentUnit) => [Number(equipmentUnit.id), equipmentUnit]));
 
   for (let index = 0; index < details.length; index += 1) {
     const detail = details[index];
@@ -1421,18 +1490,14 @@ async function validateDetails(trx, details, requestId = null, startDate = null,
     if (Number(equipmentUnit.categoryId) !== Number(detail.equipmentCategoryId)) {
       return {
         valid: false,
-        message:
-          `Equipment unit pada detail baris ${rowNumber} ` +
-          'tidak sesuai dengan equipment category.',
+        message: `Equipment unit pada detail baris ${rowNumber} ` + 'tidak sesuai dengan equipment category.',
       };
     }
 
     if (String(equipmentUnit.capacityUnit).toUpperCase() !== detail.requiredCapacityUnit) {
       return {
         valid: false,
-        message:
-          `Satuan kapasitas unit ${equipmentUnit.unitCode} ` +
-          `tidak sesuai dengan kebutuhan pada detail baris ${rowNumber}.`,
+        message: `Satuan kapasitas unit ${equipmentUnit.unitCode} ` + `tidak sesuai dengan kebutuhan pada detail baris ${rowNumber}.`,
       };
     }
 
@@ -1466,9 +1531,7 @@ async function validateDetails(trx, details, requestId = null, startDate = null,
       if (!scheduleValidation.valid) {
         return {
           valid: false,
-          message:
-            `Equipment unit ${equipmentUnit.unitCode} pada detail baris ` +
-            `${index + 1} tidak tersedia. ${scheduleValidation.message}`,
+          message: `Equipment unit ${equipmentUnit.unitCode} pada detail baris ` + `${index + 1} tidak tersedia. ${scheduleValidation.message}`,
         };
       }
     }
@@ -1514,11 +1577,7 @@ async function resolveCompanyId(trx, companyUuid, access, existingCompanyId = nu
     return null;
   }
 
-  const company = await trx('companies')
-    .where('uuid', companyUuid)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .first('id');
+  const company = await trx('companies').where('uuid', companyUuid).where('isActive', true).whereNull('deletedAt').first('id');
 
   return company?.id || null;
 }
@@ -1528,12 +1587,7 @@ async function resolveDivisionId(trx, divisionUuid, companyId) {
     return null;
   }
 
-  const division = await trx('divisions')
-    .where('uuid', divisionUuid)
-    .where('companyId', companyId)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .first('id');
+  const division = await trx('divisions').where('uuid', divisionUuid).where('companyId', companyId).where('isActive', true).whereNull('deletedAt').first('id');
 
   return division?.id || null;
 }
@@ -1559,10 +1613,7 @@ async function insertRequestDetails(trx, requestId, details, now) {
 }
 
 async function synchronizeRequestDetails(trx, requestId, details, now) {
-  const existingDetails = await trx('equipmentRequestDetails')
-    .where('requestId', requestId)
-    .whereNull('deletedAt')
-    .select(['id', 'uuid']);
+  const existingDetails = await trx('equipmentRequestDetails').where('requestId', requestId).whereNull('deletedAt').select(['id', 'uuid']);
 
   const existingByUuid = new Map(existingDetails.map((detail) => [detail.uuid, detail]));
 
@@ -1608,10 +1659,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
   if (removedDetails.length > 0) {
     const removedDetailIds = removedDetails.map((detail) => detail.id);
 
-    const existingAssignment = await trx('equipmentAssignments')
-      .whereIn('requestDetailId', removedDetailIds)
-      .whereNull('deletedAt')
-      .first('id');
+    const existingAssignment = await trx('equipmentOperations').whereIn('requestDetailId', removedDetailIds).whereNull('deletedAt').first('id');
 
     if (existingAssignment) {
       throw new Error('Detail tidak dapat dihapus karena sudah memiliki equipment assignment.');
@@ -1630,10 +1678,7 @@ async function synchronizeRequestDetails(trx, requestId, details, now) {
 }
 
 async function generateRequestApprovals(trx, equipmentRequest) {
-  const existingApproval = await trx('equipmentRequestApprovals')
-    .where('requestId', equipmentRequest.id)
-    .whereNull('deletedAt')
-    .first('id');
+  const existingApproval = await trx('equipmentRequestApprovals').where('requestId', equipmentRequest.id).whereNull('deletedAt').first('id');
 
   if (existingApproval) {
     return { valid: true };
@@ -1642,9 +1687,7 @@ async function generateRequestApprovals(trx, equipmentRequest) {
   const flows = await trx('equipmentApprovalFlows as flow')
     .select(['flow.approvalLevel', 'flow.companyId', 'flow.roleId', 'flow.actorStage'])
     .where((builder) => {
-      builder
-        .whereNull('flow.requestCompanyId')
-        .orWhere('flow.requestCompanyId', equipmentRequest.companyId);
+      builder.whereNull('flow.requestCompanyId').orWhere('flow.requestCompanyId', equipmentRequest.companyId);
     })
     .where('flow.isActive', 1)
     .whereNull('flow.deletedAt')
@@ -1808,22 +1851,15 @@ async function getRequestAccess(req, trx = db) {
   const requestData = req.getData() || {};
   const rawAccess = requestData.access || {};
   const rawUser = rawAccess.user || requestData.user || {};
-  const userId = Number(
-    rawUser.id || rawUser.userId || rawAccess.userId || requestData.userId || requestData.id
-  );
+  const userId = Number(rawUser.id || rawUser.userId || rawAccess.userId || requestData.userId || requestData.id);
 
   if (!userId) {
     throw new Error('Authenticated user access was not found.');
   }
 
   const existingCompany = rawAccess.company || requestData.company || {};
-  const existingCompanyId = Number(
-    existingCompany.id || existingCompany.companyId || rawAccess.companyId || requestData.companyId
-  );
-  const existingCompanyType =
-    existingCompany.type === null || existingCompany.type === undefined
-      ? null
-      : Number(existingCompany.type);
+  const existingCompanyId = Number(existingCompany.id || existingCompany.companyId || rawAccess.companyId || requestData.companyId);
+  const existingCompanyType = existingCompany.type === null || existingCompany.type === undefined ? null : Number(existingCompany.type);
 
   if (existingCompanyId && existingCompanyType !== null) {
     return {
@@ -1874,10 +1910,7 @@ async function getRequestAccess(req, trx = db) {
           uuid: userCompany.companyUuid,
           code: userCompany.companyCode,
           name: userCompany.companyName,
-          type:
-            userCompany.companyType === null || userCompany.companyType === undefined
-              ? null
-              : Number(userCompany.companyType),
+          type: userCompany.companyType === null || userCompany.companyType === undefined ? null : Number(userCompany.companyType),
         }
       : null,
     permissionCodes: normalizePermissionCodes(rawAccess),
@@ -1910,6 +1943,25 @@ function getInsertedId(insertResult) {
   return Number(insertResult);
 }
 
+function validateRequestAttachment(file) {
+  const extension = path.extname(String(file.originalname || '')).toLowerCase();
+  if (!REQUEST_ATTACHMENT_EXTENSIONS.has(extension)) return { valid: false, message: 'Attachment hanya boleh berupa PDF atau image (JPG, PNG, GIF, WEBP).' };
+  if (!REQUEST_ATTACHMENT_MIME_TYPES.has(file.mimetype)) return { valid: false, message: 'MIME type attachment tidak diizinkan.' };
+  const buffer = Buffer.alloc(12);
+  const fd = fs.openSync(file.path, 'r');
+  const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+  fs.closeSync(fd);
+  const head = buffer.subarray(0, bytesRead);
+  let detected = null;
+  if (head.subarray(0, 5).toString('ascii') === '%PDF-') detected = 'application/pdf';
+  else if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) detected = 'image/jpeg';
+  else if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) detected = 'image/png';
+  else if (head.length >= 6 && ['GIF87a', 'GIF89a'].includes(head.subarray(0, 6).toString('ascii'))) detected = 'image/gif';
+  else if (head.length >= 12 && head.subarray(0, 4).toString('ascii') === 'RIFF' && head.subarray(8, 12).toString('ascii') === 'WEBP') detected = 'image/webp';
+  if (!detected || detected !== file.mimetype) return { valid: false, message: 'Isi file tidak sesuai dengan tipe attachment yang diizinkan.' };
+  return { valid: true, mimeType: detected };
+}
+
 function normalizeRequestResult(request) {
   if (!request) {
     return request;
@@ -1922,10 +1974,7 @@ function normalizeRequestResult(request) {
     isActive: Boolean(request.isActive),
     statusAllowEdit: Boolean(request.statusAllowEdit),
     statusIsTerminal: Boolean(request.statusIsTerminal),
-    statusSortOrder:
-      request.statusSortOrder === null || request.statusSortOrder === undefined
-        ? null
-        : Number(request.statusSortOrder),
+    statusSortOrder: request.statusSortOrder === null || request.statusSortOrder === undefined ? null : Number(request.statusSortOrder),
   };
 }
 
@@ -2015,9 +2064,7 @@ function normalizeDate(value) {
     return null;
   }
 
-  const date = new Date(
-    Date.UTC(yearNumber, monthNumber - 1, dayNumber, hourNumber, minuteNumber, secondNumber)
-  );
+  const date = new Date(Date.UTC(yearNumber, monthNumber - 1, dayNumber, hourNumber, minuteNumber, secondNumber));
 
   if (
     date.getUTCFullYear() !== yearNumber ||

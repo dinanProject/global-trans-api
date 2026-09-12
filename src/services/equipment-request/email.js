@@ -6,16 +6,13 @@ const MODULE_CODE = 'EQUIPMENT_REQUEST';
 const TEMPLATE_APPROVAL_REQUIRED = 'EQUIPMENT_REQUEST_APPROVAL_REQUIRED';
 const TEMPLATE_STATUS_CHANGED = 'EQUIPMENT_REQUEST_STATUS_CHANGED';
 const TEMPLATE_FINAL_DECISION = 'EQUIPMENT_REQUEST_FINAL_DECISION';
-const TEMPLATE_ASSIGNED = 'EQUIPMENT_REQUEST_ASSIGNED';
+const TEMPLATE_OPERATION_READY = 'EQUIPMENT_REQUEST_OPERATION_READY';
 const TEMPLATE_OPERATION_STARTED = 'EQUIPMENT_OPERATION_STARTED';
 const TEMPLATE_OPERATION_COMPLETED = 'EQUIPMENT_OPERATION_COMPLETED';
 
 const DEFAULT_FROM_NAME = process.env.MAIL_FROM_NAME || 'Global Trans Reservation';
 
-async function enqueueRequestActionNotifications(
-  trx,
-  { equipmentRequest, transition, actionUserId, remarks }
-) {
+async function enqueueRequestActionNotifications(trx, { equipmentRequest, transition, actionUserId, remarks }) {
   const requestContext = await findRequestContext(trx, equipmentRequest.id);
 
   if (!requestContext) {
@@ -34,13 +31,14 @@ async function enqueueRequestActionNotifications(
 
   /*
    * SUBMIT:
-   * kirim ke client approver.
+   * - Exxon approver menerima action-required email.
+   * - Global Trans reviewer menerima visibility/review email, tanpa approval action.
    *
-   * APPROVE_CLIENT:
-   * kirim ke GTSI approver.
+   * APPROVE_CLIENT tidak lagi mencari next GTSI approver karena Global Trans
+   * bukan approval step pada flow baru.
    */
-  if (actionCode === 'SUBMIT' || actionCode === 'APPROVE_CLIENT') {
-    const nextApprovers = await findNextApproverRecipients(trx, equipmentRequest.id);
+  if (actionCode === 'SUBMIT') {
+    const [nextApprovers, globalReviewers] = await Promise.all([findNextApproverRecipients(trx, equipmentRequest.id), findGlobalReviewRecipients(trx)]);
 
     if (nextApprovers.length > 0) {
       await queueTemplateEmails(
@@ -50,7 +48,32 @@ async function enqueueRequestActionNotifications(
           moduleCode: MODULE_CODE,
           referenceId: equipmentRequest.id,
           referenceUuid: equipmentRequest.uuid,
-          contextCode: `APPROVAL_REQUIRED_${actionCode}`,
+          contextCode: 'APPROVAL_REQUIRED_SUBMIT',
+          contextId: equipmentRequest.id,
+          recipientUserId: recipient.id,
+          toEmail: recipient.email,
+          payload: buildPayload({
+            request: currentRequest,
+            recipient,
+            actionUser,
+            transition,
+            remarks,
+          }),
+          fromName: buildFromName(actionUser),
+        })),
+        { buildFallbackTemplate }
+      );
+    }
+
+    if (globalReviewers.length > 0) {
+      await queueTemplateEmails(
+        trx,
+        globalReviewers.map((recipient) => ({
+          templateCode: TEMPLATE_STATUS_CHANGED,
+          moduleCode: MODULE_CODE,
+          referenceId: equipmentRequest.id,
+          referenceUuid: equipmentRequest.uuid,
+          contextCode: 'GLOBAL_REVIEW_VISIBILITY_SUBMIT',
           contextId: equipmentRequest.id,
           recipientUserId: recipient.id,
           toEmail: recipient.email,
@@ -104,8 +127,41 @@ async function enqueueRequestActionNotifications(
   }
 
   /*
-   * Setelah keputusan GTSI,
-   * client approver juga menerima hasil akhir.
+   * Exxon adalah final approver. Setelah approve/reject, Global Trans reviewer
+   * menerima final-decision visibility email. Tidak ada approval lanjutan.
+   */
+  if (actionCode === 'APPROVE_CLIENT' || actionCode === 'REJECT_CLIENT') {
+    const globalReviewers = await findGlobalReviewRecipients(trx);
+
+    if (globalReviewers.length > 0) {
+      await queueTemplateEmails(
+        trx,
+        globalReviewers.map((recipient) => ({
+          templateCode: TEMPLATE_FINAL_DECISION,
+          moduleCode: MODULE_CODE,
+          referenceId: equipmentRequest.id,
+          referenceUuid: equipmentRequest.uuid,
+          contextCode: `GLOBAL_REVIEW_${actionCode}`,
+          contextId: equipmentRequest.id,
+          recipientUserId: recipient.id,
+          toEmail: recipient.email,
+          payload: buildPayload({
+            request: currentRequest,
+            recipient,
+            actionUser,
+            transition,
+            remarks,
+          }),
+          fromName: buildFromName(actionUser),
+        })),
+        { buildFallbackTemplate }
+      );
+    }
+  }
+
+  /*
+   * Legacy safety: keep the old GTSI final-decision email path for historical
+   * records only. Active transitions for these actions are disabled by migration.
    */
   if (actionCode === 'APPROVE_GTSI' || actionCode === 'REJECT_GTSI') {
     const clientApprovers = await findClientApproverRecipients(trx, equipmentRequest.id);
@@ -137,10 +193,7 @@ async function enqueueRequestActionNotifications(
   }
 }
 
-async function enqueueAssignmentNotifications(
-  trx,
-  { requestId, actionUserId, previousStatusCode = 'APPROVED' }
-) {
+async function enqueueOperationNotifications(trx, { requestId, actionUserId, previousStatusCode = 'APPROVED' }) {
   const requestContext = await findRequestContext(trx, requestId);
 
   if (!requestContext) {
@@ -155,13 +208,13 @@ async function enqueueAssignmentNotifications(
 
   const actionUser = actionUserId ? await findUserById(trx, actionUserId) : null;
 
-  const assignments = await findAssignmentNotificationDetails(trx, requestId);
+  const operations = await findOperationNotificationDetails(trx, requestId);
 
-  if (assignments.length === 0) {
+  if (operations.length === 0) {
     return;
   }
 
-  const assignmentDetailsText = buildAssignmentDetailsText(assignments);
+  const operationDetailsText = buildOperationDetailsText(operations);
 
   const payload = enrichPayload({
     recipientName: requester.fullName || 'User',
@@ -174,20 +227,20 @@ async function enqueueAssignmentNotifications(
     requesterEmail: requestContext.requesterEmail || null,
     actorName: actionUser?.fullName || 'System',
     actorEmail: actionUser?.email || null,
-    statusCode: 'ASSIGNED',
-    statusName: 'Assigned',
-    actionCode: 'ASSIGN',
-    actionName: 'Assign Equipment',
+    statusCode: 'APPROVED',
+    statusName: 'Scheduled',
+    actionCode: 'OPERATION_READY',
+    actionName: 'Operation Ready',
     fromStatusCode: previousStatusCode,
-    toStatusCode: 'ASSIGNED',
+    toStatusCode: 'APPROVED',
     remarks: '-',
     startDate: formatDateOnly(requestContext.startDate),
     endDate: formatDateOnly(requestContext.endDate),
     purpose: requestContext.purpose || '-',
     notes: requestContext.notes || '-',
-    assignmentCount: assignments.length,
-    assignmentDetailsText,
-    assignmentDetailsHtml: escapeHtml(assignmentDetailsText).replace(/\n/g, '<br>'),
+    operationCount: operations.length,
+    operationDetailsText,
+    operationDetailsHtml: escapeHtml(operationDetailsText).replace(/\n/g, '<br>'),
     requestUrl: buildFrontendUrl('/equipment-request/requests'),
   });
 
@@ -195,11 +248,11 @@ async function enqueueAssignmentNotifications(
     trx,
     [
       {
-        templateCode: TEMPLATE_ASSIGNED,
+        templateCode: TEMPLATE_OPERATION_READY,
         moduleCode: MODULE_CODE,
         referenceId: requestContext.id,
         referenceUuid: requestContext.uuid,
-        contextCode: 'REQUESTER_ASSIGN',
+        contextCode: 'REQUESTER_OPERATION_READY',
         contextId: requestContext.id,
         recipientUserId: requester.id,
         toEmail: requester.email,
@@ -211,10 +264,7 @@ async function enqueueAssignmentNotifications(
   );
 }
 
-async function enqueueOperationStartedNotifications(
-  trx,
-  { requestId, actionUserId, previousStatusCode = 'ASSIGNED' }
-) {
+async function enqueueOperationStartedNotifications(trx, { requestId, actionUserId, previousStatusCode = 'ASSIGNED' }) {
   const requestContext = await findRequestContext(trx, requestId);
 
   if (!requestContext) {
@@ -229,17 +279,15 @@ async function enqueueOperationStartedNotifications(
 
   const actionUser = actionUserId ? await findUserById(trx, actionUserId) : null;
 
-  const assignments = await findAssignmentNotificationDetails(trx, requestId);
+  const operations = await findOperationNotificationDetails(trx, requestId);
 
-  const startedAssignments = assignments.filter(
-    (assignment) => assignment.statusCode === 'IN_OPERATION' && assignment.actualStartDate
-  );
+  const startedOperations = operations.filter((operation) => operation.statusCode === 'IN_OPERATION' && operation.actualStartDate);
 
-  if (startedAssignments.length === 0) {
+  if (startedOperations.length === 0) {
     return;
   }
 
-  const operationDetailsText = buildOperationStartedDetailsText(startedAssignments);
+  const operationDetailsText = buildOperationStartedDetailsText(startedOperations);
 
   const payload = enrichPayload({
     recipientName: requester.fullName || 'User',
@@ -271,7 +319,7 @@ async function enqueueOperationStartedNotifications(
     startDate: formatDateOnly(requestContext.startDate),
     endDate: formatDateOnly(requestContext.endDate),
 
-    operationCount: startedAssignments.length,
+    operationCount: startedOperations.length,
     operationDetailsText,
     operationDetailsHtml: escapeHtml(operationDetailsText).replace(/\n/g, '<br>'),
 
@@ -298,10 +346,7 @@ async function enqueueOperationStartedNotifications(
   );
 }
 
-async function enqueueOperationCompletedNotifications(
-  trx,
-  { requestId, actionUserId, previousStatusCode = 'IN_PROGRESS' }
-) {
+async function enqueueOperationCompletedNotifications(trx, { requestId, actionUserId, previousStatusCode = 'IN_PROGRESS' }) {
   const requestContext = await findRequestContext(trx, requestId);
 
   if (!requestContext) {
@@ -316,19 +361,17 @@ async function enqueueOperationCompletedNotifications(
 
   const actionUser = actionUserId ? await findUserById(trx, actionUserId) : null;
 
-  const assignments = await findAssignmentNotificationDetails(trx, requestId);
+  const operations = await findOperationNotificationDetails(trx, requestId);
 
-  const completedAssignments = assignments.filter(
-    (assignment) => assignment.statusCode === 'COMPLETED' && assignment.actualEndDate
-  );
+  const completedOperations = operations.filter((operation) => operation.statusCode === 'COMPLETED' && operation.actualEndDate);
 
-  if (completedAssignments.length === 0) {
+  if (completedOperations.length === 0) {
     return;
   }
 
-  const completionDetailsText = buildOperationCompletedDetailsText(completedAssignments);
+  const completionDetailsText = buildOperationCompletedDetailsText(completedOperations);
 
-  const completionDetailsHtml = buildOperationCompletedDetailsHtml(completedAssignments);
+  const completionDetailsHtml = buildOperationCompletedDetailsHtml(completedOperations);
 
   const payload = enrichPayload({
     recipientName: requester.fullName || 'User',
@@ -360,8 +403,8 @@ async function enqueueOperationCompletedNotifications(
     startDate: formatDateOnly(requestContext.startDate),
     endDate: formatDateOnly(requestContext.endDate),
 
-    completionCount: completedAssignments.length,
-    overallSlaStatus: getOverallCompletionSlaStatus(completedAssignments),
+    completionCount: completedOperations.length,
+    overallSlaStatus: getOverallCompletionSlaStatus(completedOperations),
 
     completionDetailsText,
     completionDetailsHtml,
@@ -395,9 +438,7 @@ async function findRequestContext(trx, requestId) {
     .leftJoin('divisions as division', 'division.id', 'request.divisionId')
     .leftJoin('users as requester', 'requester.id', 'request.requestBy')
     .leftJoin('equipmentRequestStatuses as status', function () {
-      this.on('status.code', '=', 'request.status')
-        .andOnVal('status.isActive', '=', 1)
-        .andOnNull('status.deletedAt');
+      this.on('status.code', '=', 'request.status').andOnVal('status.isActive', '=', 1).andOnNull('status.deletedAt');
     })
     .where('request.id', requestId)
     .whereNull('request.deletedAt')
@@ -450,23 +491,23 @@ async function findRequestContext(trx, requestId) {
   };
 }
 
-async function findAssignmentNotificationDetails(trx, requestId) {
-  return trx('equipmentAssignments as assignment')
-    .join('equipmentRequestDetails as detail', 'detail.id', 'assignment.requestDetailId')
-    .join('equipmentUnits as unit', 'unit.id', 'assignment.equipmentUnitId')
+async function findOperationNotificationDetails(trx, requestId) {
+  return trx('equipmentOperations as operation')
+    .join('equipmentRequestDetails as detail', 'detail.id', 'operation.requestDetailId')
+    .join('equipmentUnits as unit', 'unit.id', 'operation.equipmentUnitId')
     .leftJoin('equipmentCategories as category', 'category.id', 'detail.equipmentCategoryId')
-    .where('assignment.requestId', requestId)
-    .where('assignment.isActive', true)
-    .whereNull('assignment.deletedAt')
-    .whereNotIn('assignment.statusCode', ['REPLACED', 'CANCELLED'])
+    .where('operation.requestId', requestId)
+    .where('operation.isActive', true)
+    .whereNull('operation.deletedAt')
+    .whereNotIn('operation.statusCode', ['REPLACED', 'CANCELLED'])
     .select([
-      'assignment.uuid',
-      'assignment.statusCode',
-      'assignment.plannedStartDate',
-      'assignment.plannedEndDate',
-      'assignment.actualStartDate',
-      'assignment.actualEndDate',
-      'assignment.notes',
+      'operation.uuid',
+      'operation.statusCode',
+      'operation.plannedStartDate',
+      'operation.plannedEndDate',
+      'operation.actualStartDate',
+      'operation.actualEndDate',
+      'operation.notes',
       'category.code as categoryCode',
       'category.name as categoryName',
       'unit.unitCode',
@@ -479,7 +520,7 @@ async function findAssignmentNotificationDetails(trx, requestId) {
         order: 'asc',
       },
       {
-        column: 'assignment.id',
+        column: 'operation.id',
         order: 'asc',
       },
     ]);
@@ -520,15 +561,33 @@ async function findNextApproverRecipients(trx, requestId) {
     .where((builder) => {
       approvalRows.forEach((approval) => {
         builder.orWhere((rowBuilder) => {
-          rowBuilder
-            .where('user.companyId', approval.companyId)
-            .where('userRole.roleId', approval.roleId);
+          rowBuilder.where('user.companyId', approval.companyId).where('userRole.roleId', approval.roleId);
         });
       });
     })
     .distinct(['user.id', 'user.uuid', 'user.fullName', 'user.email', 'user.companyId']);
 
   return recipientQuery;
+}
+
+async function findGlobalReviewRecipients(trx) {
+  return trx('users as user')
+    .join('companies as company', function () {
+      this.on('company.id', '=', 'user.companyId').andOnNull('company.deletedAt');
+    })
+    .join('userRoles as userRole', 'userRole.userId', 'user.id')
+    .join('roles as role', 'role.id', 'userRole.roleId')
+    .join('rolePermissions as rolePermission', 'rolePermission.roleId', 'role.id')
+    .join('permissions as permission', 'permission.permissionId', 'rolePermission.permissionId')
+    .where('user.isActive', true)
+    .whereNull('user.deletedAt')
+    .whereNotNull('user.email')
+    .where('company.isActive', true)
+    .where('company.type', 1)
+    .where('role.isActive', true)
+    .where('permission.isActive', true)
+    .where('permission.code', 'EQUIPMENT_APPROVAL.VIEW')
+    .distinct(['user.id', 'user.uuid', 'user.fullName', 'user.email', 'user.companyId']);
 }
 
 async function findClientApproverRecipients(trx, requestId) {
@@ -558,10 +617,7 @@ async function findUserById(trx, userId) {
     return null;
   }
 
-  return trx('users')
-    .where('id', userId)
-    .whereNull('deletedAt')
-    .first(['id', 'uuid', 'fullName', 'email', 'companyId']);
+  return trx('users').where('id', userId).whereNull('deletedAt').first(['id', 'uuid', 'fullName', 'email', 'companyId']);
 }
 
 function buildPayload({ request, recipient, actionUser, transition, remarks }) {
@@ -597,12 +653,7 @@ function buildPayload({ request, recipient, actionUser, transition, remarks }) {
 }
 
 function buildFrontendUrl(path) {
-  const baseUrl = (
-    process.env.APP_URL ||
-    process.env.FRONTEND_URL ||
-    process.env.APP_FRONTEND_URL ||
-    ''
-  ).replace(/\/$/, '');
+  const baseUrl = (process.env.APP_URL || process.env.FRONTEND_URL || process.env.APP_FRONTEND_URL || '').replace(/\/$/, '');
 
   if (!path) return baseUrl;
   if (/^https?:\/\//i.test(path)) return path;
@@ -641,107 +692,102 @@ function buildDetailsText(details) {
     .join('\n');
 }
 
-function buildAssignmentDetailsText(assignments) {
-  if (!assignments.length) {
+function buildOperationDetailsText(operations) {
+  if (!operations.length) {
     return '-';
   }
 
-  return assignments
-    .map((assignment, index) => {
-      const equipmentName = assignment.unitName || assignment.categoryName || 'Equipment';
+  return operations
+    .map((operation, index) => {
+      const equipmentName = operation.unitName || operation.categoryName || 'Equipment';
 
-      const equipmentCode = assignment.unitCode || assignment.categoryCode || '-';
+      const equipmentCode = operation.unitCode || operation.categoryCode || '-';
 
-      const assetNumber = assignment.assetNumber ? ` | Asset: ${assignment.assetNumber}` : '';
+      const assetNumber = operation.assetNumber ? ` | Asset: ${operation.assetNumber}` : '';
 
-      const period = `${formatDateOnly(
-        assignment.plannedStartDate
-      )} sampai ${formatDateOnly(assignment.plannedEndDate)}`;
+      const period = `${formatDateOnly(operation.plannedStartDate)} sampai ${formatDateOnly(operation.plannedEndDate)}`;
+
+      return [`${index + 1}. ${equipmentCode} - ${equipmentName}${assetNumber}`, `   Planned: ${period}`].join('\n');
+    })
+    .join('\n');
+}
+
+function buildOperationStartedDetailsText(operations) {
+  if (!operations.length) {
+    return '-';
+  }
+
+  return operations
+    .map((operation, index) => {
+      const equipmentName = operation.unitName || operation.categoryName || 'Equipment';
+
+      const equipmentCode = operation.unitCode || operation.categoryCode || '-';
+
+      const assetNumber = operation.assetNumber ? ` | Asset: ${operation.assetNumber}` : '';
 
       return [
         `${index + 1}. ${equipmentCode} - ${equipmentName}${assetNumber}`,
-        `   Planned: ${period}`,
+        `   Planned Start: ${formatDateOnly(operation.plannedStartDate)}`,
+        `   Actual Start : ${formatDateTime(operation.actualStartDate)}`,
+        `   Planned End  : ${formatDateOnly(operation.plannedEndDate)}`,
+        `   SLA Status   : ${getStartSlaStatus(operation)}`,
       ].join('\n');
     })
     .join('\n');
 }
 
-function buildOperationStartedDetailsText(assignments) {
-  if (!assignments.length) {
+function buildOperationCompletedDetailsText(operations) {
+  if (!operations.length) {
     return '-';
   }
 
-  return assignments
-    .map((assignment, index) => {
-      const equipmentName = assignment.unitName || assignment.categoryName || 'Equipment';
+  return operations
+    .map((operation, index) => {
+      const equipmentName = operation.unitName || operation.categoryName || 'Equipment';
 
-      const equipmentCode = assignment.unitCode || assignment.categoryCode || '-';
+      const equipmentCode = operation.unitCode || operation.categoryCode || '-';
 
-      const assetNumber = assignment.assetNumber ? ` | Asset: ${assignment.assetNumber}` : '';
+      const assetNumber = operation.assetNumber ? ` | Asset: ${operation.assetNumber}` : '';
 
       return [
         `${index + 1}. ${equipmentCode} - ${equipmentName}${assetNumber}`,
-        `   Planned Start: ${formatDateOnly(assignment.plannedStartDate)}`,
-        `   Actual Start : ${formatDateTime(assignment.actualStartDate)}`,
-        `   Planned End  : ${formatDateOnly(assignment.plannedEndDate)}`,
-        `   SLA Status   : ${getStartSlaStatus(assignment)}`,
+        `   Planned Start: ${formatDateOnly(operation.plannedStartDate)}`,
+        `   Actual Start : ${formatDateTime(operation.actualStartDate)}`,
+        `   Planned End  : ${formatDateOnly(operation.plannedEndDate)}`,
+        `   Actual End   : ${formatDateTime(operation.actualEndDate)}`,
+        `   SLA Status   : ${getCompletionSlaStatus(operation)}`,
       ].join('\n');
     })
     .join('\n');
 }
 
-function buildOperationCompletedDetailsText(assignments) {
-  if (!assignments.length) {
-    return '-';
-  }
-
-  return assignments
-    .map((assignment, index) => {
-      const equipmentName = assignment.unitName || assignment.categoryName || 'Equipment';
-
-      const equipmentCode = assignment.unitCode || assignment.categoryCode || '-';
-
-      const assetNumber = assignment.assetNumber ? ` | Asset: ${assignment.assetNumber}` : '';
-
-      return [
-        `${index + 1}. ${equipmentCode} - ${equipmentName}${assetNumber}`,
-        `   Planned Start: ${formatDateOnly(assignment.plannedStartDate)}`,
-        `   Actual Start : ${formatDateTime(assignment.actualStartDate)}`,
-        `   Planned End  : ${formatDateOnly(assignment.plannedEndDate)}`,
-        `   Actual End   : ${formatDateTime(assignment.actualEndDate)}`,
-        `   SLA Status   : ${getCompletionSlaStatus(assignment)}`,
-      ].join('\n');
-    })
-    .join('\n');
-}
-
-function getStartSlaStatus(assignment) {
-  if (!assignment.actualStartDate) {
+function getStartSlaStatus(operation) {
+  if (!operation.actualStartDate) {
     return 'Not Started';
   }
 
-  if (!assignment.plannedStartDate) {
+  if (!operation.plannedStartDate) {
     return 'Started';
   }
 
-  const actualStartDate = formatDateOnly(assignment.actualStartDate);
-  const plannedStartDate = formatDateOnly(assignment.plannedStartDate);
+  const actualStartDate = formatDateOnly(operation.actualStartDate);
+  const plannedStartDate = formatDateOnly(operation.plannedStartDate);
   return actualStartDate <= plannedStartDate ? 'On Time Start' : 'Late Start';
 }
 
-function buildOperationCompletedDetailsHtml(assignments) {
-  if (!assignments.length) {
+function buildOperationCompletedDetailsHtml(operations) {
+  if (!operations.length) {
     return '-';
   }
 
-  return assignments
-    .map((assignment, index) => {
-      const equipmentName = assignment.unitName || assignment.categoryName || 'Equipment';
+  return operations
+    .map((operation, index) => {
+      const equipmentName = operation.unitName || operation.categoryName || 'Equipment';
 
-      const equipmentCode = assignment.unitCode || assignment.categoryCode || '-';
+      const equipmentCode = operation.unitCode || operation.categoryCode || '-';
 
-      const assetNumber = assignment.assetNumber || '-';
-      const slaStatus = getCompletionSlaStatus(assignment);
+      const assetNumber = operation.assetNumber || '-';
+      const slaStatus = getCompletionSlaStatus(operation);
 
       return `
         <div style="margin-bottom:12px;padding:14px 16px;border:1px solid #e2e8f0;border-radius:8px;background:#ffffff;">
@@ -756,19 +802,19 @@ function buildOperationCompletedDetailsHtml(assignments) {
             </tr>
             <tr>
               <td style="padding:2px 0;color:#64748b;">Planned Start</td>
-              <td style="padding:2px 0;">${escapeHtml(formatDateOnly(assignment.plannedStartDate))}</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateOnly(operation.plannedStartDate))}</td>
             </tr>
             <tr>
               <td style="padding:2px 0;color:#64748b;">Actual Start</td>
-              <td style="padding:2px 0;">${escapeHtml(formatDateTime(assignment.actualStartDate))}</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateTime(operation.actualStartDate))}</td>
             </tr>
             <tr>
               <td style="padding:2px 0;color:#64748b;">Planned End</td>
-              <td style="padding:2px 0;">${escapeHtml(formatDateOnly(assignment.plannedEndDate))}</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateOnly(operation.plannedEndDate))}</td>
             </tr>
             <tr>
               <td style="padding:2px 0;color:#64748b;">Actual End</td>
-              <td style="padding:2px 0;">${escapeHtml(formatDateTime(assignment.actualEndDate))}</td>
+              <td style="padding:2px 0;">${escapeHtml(formatDateTime(operation.actualEndDate))}</td>
             </tr>
             <tr>
               <td style="padding:2px 0;color:#64748b;">SLA Status</td>
@@ -783,30 +829,28 @@ function buildOperationCompletedDetailsHtml(assignments) {
     .join('');
 }
 
-function getCompletionSlaStatus(assignment) {
-  if (!assignment.actualEndDate) {
+function getCompletionSlaStatus(operation) {
+  if (!operation.actualEndDate) {
     return 'Not Completed';
   }
 
-  if (!assignment.plannedEndDate) {
+  if (!operation.plannedEndDate) {
     return 'Completed';
   }
 
-  const actualEndDate = formatDateOnly(assignment.actualEndDate);
+  const actualEndDate = formatDateOnly(operation.actualEndDate);
 
-  const plannedEndDate = formatDateOnly(assignment.plannedEndDate);
+  const plannedEndDate = formatDateOnly(operation.plannedEndDate);
 
   return actualEndDate <= plannedEndDate ? 'Completed On Time' : 'Completed Late';
 }
 
-function getOverallCompletionSlaStatus(assignments) {
-  if (!assignments.length) {
+function getOverallCompletionSlaStatus(operations) {
+  if (!operations.length) {
     return '-';
   }
 
-  const hasLateCompletion = assignments.some(
-    (assignment) => getCompletionSlaStatus(assignment) === 'Completed Late'
-  );
+  const hasLateCompletion = operations.some((operation) => getCompletionSlaStatus(operation) === 'Completed Late');
 
   return hasLateCompletion ? 'Completed Late' : 'Completed On Time';
 }
@@ -836,9 +880,9 @@ function buildFallbackTemplate(templateCode, payload) {
     };
   }
 
-  if (templateCode === TEMPLATE_ASSIGNED) {
+  if (templateCode === TEMPLATE_OPERATION_READY) {
     return {
-      subject: `Equipment assigned: ${payload.requestNo}`,
+      subject: `Operation scheduled: ${payload.requestNo}`,
       html: `<!doctype html>
 <html>
   <body>
@@ -847,7 +891,7 @@ function buildFallbackTemplate(templateCode, payload) {
     <p>
       Equipment untuk request
       <strong>{{requestNo}}</strong>
-      telah selesai di-assign.
+      telah dijadwalkan untuk operasi.
     </p>
 
     <p>
@@ -858,8 +902,8 @@ function buildFallbackTemplate(templateCode, payload) {
     </p>
 
     <p>
-      Equipment Assignment:<br>
-      {{assignmentDetailsHtml}}
+      Equipment Operation:<br>
+      {{operationDetailsHtml}}
     </p>
 
     <p>
@@ -871,15 +915,15 @@ function buildFallbackTemplate(templateCode, payload) {
 </html>`,
       text: `Halo {{recipientName}},
 
-Equipment untuk request {{requestNo}} telah selesai di-assign.
+Equipment untuk request {{requestNo}} telah dijadwalkan untuk operasi.
 
 Company: {{companyName}}
 Division: {{divisionName}}
 Status: {{statusName}}
 Planned Period: {{startDate}} sampai {{endDate}}
 
-Equipment Assignment:
-{{assignmentDetailsText}}
+Equipment Operation:
+{{operationDetailsText}}
 
 Buka halaman request:
 {{requestUrl}}`,
@@ -1046,7 +1090,7 @@ function formatDateTime(value) {
 
 module.exports = {
   enqueueRequestActionNotifications,
-  enqueueAssignmentNotifications,
+  enqueueOperationNotifications,
   enqueueOperationStartedNotifications,
   enqueueOperationCompletedNotifications,
 };

@@ -1,26 +1,18 @@
 'use strict';
 
-const {
-  createMenuNotifications,
-  deactivateReferenceNotifications,
-} = require('../menu-notification');
+const { createMenuNotifications, deactivateReferenceNotifications } = require('../menu-notification');
 
 const MODULE_CODE = 'EQUIPMENT_REQUEST';
 const HOLDER_COMPANY_TYPE = 1;
 const APPROVAL_MENU_PERMISSION_CODE = 'EQUIPMENT_APPROVAL.VIEW';
-const ASSIGNMENT_MENU_PERMISSION_CODE = 'EQUIPMENT_REQUEST.ASSIGN';
-const ASSIGNMENT_MENU_ROUTES = [
-  '/equipment-request/assignments',
-  '/main/equipment-request/assignments',
-  'equipment-request/assignments',
-  'main/equipment-request/assignments',
+const OPERATIONS_MENU_PERMISSION_CODE = 'EQUIPMENT_OPERATION.VIEW';
+const OPERATIONS_MENU_ROUTES = [
+  '/equipment-request/operations',
+  '/main/equipment-request/operations',
+  'equipment-request/operations',
+  'main/equipment-request/operations',
 ];
-const APPROVAL_DECISION_ACTIONS = new Set([
-  'APPROVE_CLIENT',
-  'APPROVE_GTSI',
-  'REJECT_CLIENT',
-  'REJECT_GTSI',
-]);
+const APPROVAL_DECISION_ACTIONS = new Set(['REJECT_CLIENT']);
 
 async function enqueueRequestActionMenuNotifications(trx, { equipmentRequest, transition }) {
   if (!equipmentRequest?.id || !equipmentRequest?.uuid || !transition?.actionCode) {
@@ -37,36 +29,52 @@ async function enqueueRequestActionMenuNotifications(trx, { equipmentRequest, tr
     });
   }
 
-  if (actionCode === 'APPROVE_GTSI') {
-    const [recipients, assignmentMenuCode] = await Promise.all([
-      findAssignmentRecipients(trx),
-      findAssignmentMenuCode(trx),
-    ]);
+  if (actionCode === 'APPROVE_CLIENT') {
+    const operationMenuCode = await findOperationMenuCode(trx);
+    const recipients = await findOperationRecipients(trx);
 
-    if (recipients.length === 0 || !assignmentMenuCode) {
-      return;
+    if (operationMenuCode && recipients.length > 0) {
+      await createMenuNotifications(
+        trx,
+        recipients.map((recipient) => ({
+          recipientUserId: recipient.id,
+          moduleCode: MODULE_CODE,
+          menuCode: operationMenuCode,
+          menuPermissionCode: OPERATIONS_MENU_PERMISSION_CODE,
+          referenceId: equipmentRequest.id,
+          referenceUuid: equipmentRequest.uuid,
+          contextCode: 'OPERATIONS_READY_APPROVED',
+        }))
+      );
     }
 
-    await createMenuNotifications(
-      trx,
-      recipients.map((recipient) => ({
-        recipientUserId: recipient.id,
-        moduleCode: MODULE_CODE,
-        menuCode: assignmentMenuCode,
-        referenceId: equipmentRequest.id,
-        referenceUuid: equipmentRequest.uuid,
-        contextCode: 'ASSIGNMENT_REQUIRED_APPROVE_GTSI',
-      }))
-    );
-
     return;
   }
 
-  if (!['SUBMIT', 'APPROVE_CLIENT'].includes(actionCode)) {
+  if (actionCode !== 'SUBMIT') {
     return;
   }
 
-  const recipients = await findNextApproverRecipients(trx, equipmentRequest.id);
+  const [approvers, globalReviewers] = await Promise.all([findNextApproverRecipients(trx, equipmentRequest.id), findGlobalReviewRecipients(trx)]);
+  const recipientsById = new Map();
+
+  approvers.forEach((recipient) => {
+    recipientsById.set(Number(recipient.id), {
+      ...recipient,
+      contextCode: 'APPROVAL_REQUIRED_SUBMIT',
+    });
+  });
+
+  globalReviewers.forEach((recipient) => {
+    if (!recipientsById.has(Number(recipient.id))) {
+      recipientsById.set(Number(recipient.id), {
+        ...recipient,
+        contextCode: 'GLOBAL_REVIEW_VISIBILITY_SUBMIT',
+      });
+    }
+  });
+
+  const recipients = [...recipientsById.values()];
 
   if (recipients.length === 0) {
     return;
@@ -80,25 +88,25 @@ async function enqueueRequestActionMenuNotifications(trx, { equipmentRequest, tr
       menuPermissionCode: APPROVAL_MENU_PERMISSION_CODE,
       referenceId: equipmentRequest.id,
       referenceUuid: equipmentRequest.uuid,
-      contextCode: `APPROVAL_REQUIRED_${actionCode}`,
+      contextCode: recipient.contextCode,
     }))
   );
 }
 
-async function deactivateAssignmentMenuNotifications(trx, equipmentRequest) {
+async function deactivateOperationMenuNotifications(trx, equipmentRequest) {
   if (!equipmentRequest?.uuid) {
     return 0;
   }
 
-  const assignmentMenuCode = await findAssignmentMenuCode(trx);
+  const operationMenuCode = await findOperationMenuCode(trx);
 
-  if (!assignmentMenuCode) {
+  if (!operationMenuCode) {
     return 0;
   }
 
   return deactivateReferenceNotifications(trx, {
     moduleCode: MODULE_CODE,
-    menuCode: assignmentMenuCode,
+    menuCode: operationMenuCode,
     referenceUuid: equipmentRequest.uuid,
   });
 }
@@ -135,40 +143,14 @@ async function findNextApproverRecipients(trx, requestId) {
     .where((builder) => {
       approvalRows.forEach((approval) => {
         builder.orWhere((rowBuilder) => {
-          rowBuilder
-            .where('user.companyId', approval.companyId)
-            .where('userRole.roleId', approval.roleId);
+          rowBuilder.where('user.companyId', approval.companyId).where('userRole.roleId', approval.roleId);
         });
       });
     })
     .distinct(['user.id']);
 }
 
-async function findAssignmentMenuCode(trx) {
-  const menu = await trx('menus as menu')
-    .where('menu.isActive', true)
-    .whereIn('menu.route', ASSIGNMENT_MENU_ROUTES)
-    .orderBy('menu.sequence', 'asc')
-    .orderBy('menu.menuId', 'asc')
-    .first('menu.code');
-
-  if (menu?.code) {
-    return menu.code;
-  }
-
-  const fallbackMenu = await trx('menus as menu')
-    .join('permissions as permission', 'permission.permissionId', 'menu.permissionId')
-    .where('menu.isActive', true)
-    .where('permission.isActive', true)
-    .where('permission.code', ASSIGNMENT_MENU_PERMISSION_CODE)
-    .orderBy('menu.sequence', 'asc')
-    .orderBy('menu.menuId', 'asc')
-    .first('menu.code');
-
-  return fallbackMenu?.code ?? null;
-}
-
-async function findAssignmentRecipients(trx) {
+async function findGlobalReviewRecipients(trx) {
   return trx('users as user')
     .join('companies as company', function () {
       this.on('company.id', '=', 'user.companyId').andOnNull('company.deletedAt');
@@ -183,11 +165,54 @@ async function findAssignmentRecipients(trx) {
     .where('company.type', HOLDER_COMPANY_TYPE)
     .where('role.isActive', true)
     .where('permission.isActive', true)
-    .where('permission.code', ASSIGNMENT_MENU_PERMISSION_CODE)
+    .where('permission.code', APPROVAL_MENU_PERMISSION_CODE)
+    .distinct(['user.id']);
+}
+
+async function findOperationMenuCode(trx) {
+  const menu = await trx('menus as menu')
+    .where('menu.isActive', true)
+    .whereIn('menu.route', OPERATIONS_MENU_ROUTES)
+    .orderBy('menu.sequence', 'asc')
+    .orderBy('menu.menuId', 'asc')
+    .first('menu.code');
+
+  if (menu?.code) {
+    return menu.code;
+  }
+
+  const fallbackMenu = await trx('menus as menu')
+    .join('permissions as permission', 'permission.permissionId', 'menu.permissionId')
+    .where('menu.isActive', true)
+    .where('permission.isActive', true)
+    .where('permission.code', OPERATIONS_MENU_PERMISSION_CODE)
+    .orderBy('menu.sequence', 'asc')
+    .orderBy('menu.menuId', 'asc')
+    .first('menu.code');
+
+  return fallbackMenu?.code ?? null;
+}
+
+async function findOperationRecipients(trx) {
+  return trx('users as user')
+    .join('companies as company', function () {
+      this.on('company.id', '=', 'user.companyId').andOnNull('company.deletedAt');
+    })
+    .join('userRoles as userRole', 'userRole.userId', 'user.id')
+    .join('roles as role', 'role.id', 'userRole.roleId')
+    .join('rolePermissions as rolePermission', 'rolePermission.roleId', 'role.id')
+    .join('permissions as permission', 'permission.permissionId', 'rolePermission.permissionId')
+    .where('user.isActive', true)
+    .whereNull('user.deletedAt')
+    .where('company.isActive', true)
+    .where('company.type', HOLDER_COMPANY_TYPE)
+    .where('role.isActive', true)
+    .where('permission.isActive', true)
+    .where('permission.code', OPERATIONS_MENU_PERMISSION_CODE)
     .distinct(['user.id']);
 }
 
 module.exports = {
   enqueueRequestActionMenuNotifications,
-  deactivateAssignmentMenuNotifications,
+  deactivateOperationMenuNotifications,
 };
