@@ -19,8 +19,7 @@ const { enqueueRequestActionNotifications } = require('../../services/equipment-
 const { enqueueRequestActionMenuNotifications } = require('../../services/equipment-request/notification');
 
 const HOLDER_COMPANY_TYPE = 1;
-const STATUS_DRAFT = 'DRAFT';
-const ACTION_SUBMIT = 'SUBMIT';
+const STATUS_CLIENT_REVIEW = 'CLIENT_REVIEW';
 const SCHEDULE_REVIEW_ACTIONS = new Set(['APPROVE_CLIENT', 'APPROVE_GTSI']);
 const REQUEST_ATTACHMENT_MODULE = 'EQUIPMENT_REQUEST';
 const REQUEST_ATTACHMENT_DOCUMENT_TYPE = 'SUPPORTING_DOCUMENT';
@@ -42,7 +41,6 @@ router.use(authentication);
  * - search
  * - status
  * - companyUuid
- * - divisionUuid
  * - startDate
  * - endDate
  * - isActive
@@ -51,14 +49,11 @@ router
   .get('/', authorization('EQUIPMENT_REQUEST.VIEW'), async (req, res) => {
     try {
       const access = await getRequestAccess(req);
-      const { search, status, companyUuid, divisionUuid, startDate, endDate, isActive } = req.query;
+      const { search, status, companyUuid, startDate, endDate, isActive } = req.query;
 
       const query = db('equipmentRequests as request')
         .leftJoin('companies as company', function () {
           this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
-        })
-        .leftJoin('divisions as division', function () {
-          this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
         })
         .leftJoin('users as requester', function () {
           this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
@@ -74,10 +69,7 @@ router
           'company.uuid as companyUuid',
           'company.code as companyCode',
           'company.name as companyName',
-          'request.divisionId',
-          'division.uuid as divisionUuid',
-          'division.code as divisionCode',
-          'division.name as divisionName',
+          'request.purpose as divisionName',
           'request.requestBy',
           'requester.uuid as requestByUuid',
           'requester.fullName as requestByName',
@@ -110,8 +102,6 @@ router
             .where('request.requestNo', 'like', normalizedSearch)
             .orWhere('company.code', 'like', normalizedSearch)
             .orWhere('company.name', 'like', normalizedSearch)
-            .orWhere('division.code', 'like', normalizedSearch)
-            .orWhere('division.name', 'like', normalizedSearch)
             .orWhere('requester.fullName', 'like', normalizedSearch)
             .orWhere('request.purpose', 'like', normalizedSearch)
             .orWhere('request.notes', 'like', normalizedSearch);
@@ -124,10 +114,6 @@ router
 
       if (companyUuid) {
         query.andWhere('company.uuid', String(companyUuid).trim());
-      }
-
-      if (divisionUuid) {
-        query.andWhere('division.uuid', String(divisionUuid).trim());
       }
 
       if (startDate) {
@@ -282,6 +268,77 @@ router
       return res.err(500, error.message || 'Failed to retrieve request statuses');
     }
   })
+
+  .get(
+    '/unit-availability',
+    authorization(['EQUIPMENT_REQUEST.VIEW', 'EQUIPMENT_REQUEST.CREATE', 'EQUIPMENT_REQUEST.UPDATE'], { requireAll: false }),
+    async (req, res) => {
+      try {
+        const startDate = normalizeDate(req.query?.startDate);
+        const endDate = normalizeDate(req.query?.endDate);
+
+        if (!startDate || !endDate) {
+          return res.incomplete('Start date dan end date wajib diisi untuk mengecek availability unit.');
+        }
+
+        if (startDate >= endDate) {
+          return res.incomplete('End date dan waktu harus lebih besar dari start date dan waktu.');
+        }
+
+        let excludedRequestId = null;
+        const requestUuid = normalizeNullableString(req.query?.requestUuid);
+
+        if (requestUuid) {
+          const access = await getRequestAccess(req);
+          const currentRequest = await findRequestByUuid(requestUuid, access);
+          excludedRequestId = currentRequest?.id || null;
+        }
+
+        const query = db('equipmentOperations as assignment')
+          .leftJoin('equipmentRequestDetails as requestDetail', 'requestDetail.id', 'assignment.requestDetailId')
+          .where('assignment.isActive', true)
+          .whereNull('assignment.deletedAt')
+          .whereNull('requestDetail.deletedAt')
+          .whereNotIn('assignment.statusCode', ['CANCELLED', 'STOPPED'])
+          .where('assignment.plannedStartDate', '<=', endDate)
+          .andWhereRaw(
+            `
+              COALESCE(
+                GREATEST(
+                  assignment.plannedEndDate,
+                  assignment.actualEndDate
+                ),
+                assignment.plannedEndDate
+              ) >= ?
+            `,
+            [startDate]
+          );
+
+        if (excludedRequestId) {
+          query.andWhere('requestDetail.requestId', '!=', excludedRequestId);
+        }
+
+        const rows = await query.select([
+          'assignment.equipmentUnitId',
+          'assignment.statusCode',
+          'assignment.plannedStartDate',
+          'assignment.plannedEndDate',
+          'assignment.actualEndDate',
+        ]);
+
+        const unavailableUnitIds = [...new Set(rows.map((row) => Number(row.equipmentUnitId)).filter(Boolean))];
+
+        return res.success({
+          startDate,
+          endDate,
+          unavailableUnitIds,
+        });
+      } catch (error) {
+        console.error('GET /equipment-request/unit-availability error:', error);
+        return res.fail(error.message || 'Failed to check equipment unit availability.');
+      }
+    }
+  )
   /**
    * GET /equipment-request/:uuid
    */
@@ -340,14 +397,6 @@ router
         return res.incomplete('Company tidak valid atau tidak aktif.');
       }
 
-      const divisionId = await resolveDivisionId(trx, payload.divisionUuid, companyId);
-
-      if (payload.divisionUuid && !divisionId) {
-        await trx.rollback();
-
-        return res.incomplete('Division tidak valid, tidak aktif, atau bukan milik company tersebut.');
-      }
-
       const detailValidation = await validateDetails(trx, payload.details, null, payload.startDate, payload.endDate);
 
       if (!detailValidation.valid) {
@@ -356,16 +405,16 @@ router
         return res.incomplete(detailValidation.message);
       }
 
-      const draftStatus = await trx('equipmentRequestStatuses')
-        .where('code', STATUS_DRAFT)
+      const initialStatus = await trx('equipmentRequestStatuses')
+        .where('code', STATUS_CLIENT_REVIEW)
         .where('isActive', 1)
         .whereNull('deletedAt')
-        .first(['code', 'allowEdit']);
+        .first(['code']);
 
-      if (!draftStatus) {
+      if (!initialStatus) {
         await trx.rollback();
 
-        return res.incomplete(`Status ${STATUS_DRAFT} belum tersedia atau tidak aktif.`);
+        return res.incomplete(`Status ${STATUS_CLIENT_REVIEW} belum tersedia atau tidak aktif.`);
       }
 
       const now = db.fn.now();
@@ -376,14 +425,14 @@ router
         uuid,
         requestNo,
         companyId,
-        divisionId,
+        divisionId: null,
         requestBy: access.user.id,
         requestDate: new Date(),
         startDate: payload.startDate,
         endDate: payload.endDate,
-        purpose: payload.purpose,
+        purpose: payload.divisionName,
         notes: payload.notes,
-        status: STATUS_DRAFT,
+        status: STATUS_CLIENT_REVIEW,
         currentApprovalLevel: 1,
         approvalLocked: false,
         isActive: true,
@@ -396,12 +445,63 @@ router
 
       await insertRequestDetails(trx, requestId, payload.details, now);
 
+      const approvalGeneration = await generateRequestApprovals(trx, {
+        id: requestId,
+        companyId,
+      });
+
+      if (!approvalGeneration.valid) {
+        await trx.rollback();
+
+        return res.incomplete(approvalGeneration.message);
+      }
+
+      const firstApprovalLevel = await findNextPendingApprovalLevel(trx, requestId);
+
+      if (!firstApprovalLevel) {
+        await trx.rollback();
+
+        return res.incomplete('Approval pending tidak ditemukan setelah request dibuat.');
+      }
+
+      await trx('equipmentRequests').where('id', requestId).update({
+        currentApprovalLevel: firstApprovalLevel,
+        updatedAt: now,
+      });
+
       await insertRequestHistory(trx, {
         requestId,
         activity: 'CREATE',
-        description: `Equipment request ${requestNo} dibuat sebagai draft.`,
+        description: `Equipment request ${requestNo} dibuat dan langsung dikirim untuk approval.`,
         userId: access.user.id,
         createdAt: now,
+      });
+
+      const initialApprovalTransition = {
+        actionCode: 'SUBMIT',
+        actionName: 'Submit',
+        fromStatusCode: null,
+        toStatusCode: STATUS_CLIENT_REVIEW,
+        toStatusName: 'Client Review',
+      };
+
+      const createdEquipmentRequest = {
+        id: requestId,
+        uuid,
+        companyId,
+        requestBy: access.user.id,
+      };
+
+      await enqueueRequestActionNotifications(trx, {
+        equipmentRequest: createdEquipmentRequest,
+        transition: initialApprovalTransition,
+        actionUserId: access.user.id,
+        remarks: null,
+      });
+
+      await enqueueRequestActionMenuNotifications(trx, {
+        equipmentRequest: createdEquipmentRequest,
+        transition: initialApprovalTransition,
       });
 
       await trx.commit();
@@ -444,6 +544,12 @@ router
         return res.incomplete('Equipment request sudah dikunci dan tidak dapat diubah.');
       }
 
+      if (!isHolderAccess(access) && Number(existingRequest.requestBy) !== Number(access.user.id)) {
+        await trx.rollback();
+
+        return res.unauthorized('Equipment request hanya dapat diubah oleh requestor yang membuat request.');
+      }
+
       if (!Boolean(existingRequest.statusAllowEdit)) {
         await trx.rollback();
 
@@ -451,7 +557,9 @@ router
       }
 
       const payload = normalizePayload(req.body);
-      const validation = validatePayload(payload);
+      const validation = validatePayload(payload, {
+        originalStartDate: existingRequest.originalStartDate,
+      });
 
       if (!validation.valid) {
         await trx.rollback();
@@ -467,14 +575,6 @@ router
         return res.incomplete('Company tidak valid atau tidak aktif.');
       }
 
-      const divisionId = await resolveDivisionId(trx, payload.divisionUuid, companyId);
-
-      if (payload.divisionUuid && !divisionId) {
-        await trx.rollback();
-
-        return res.incomplete('Division tidak valid, tidak aktif, atau bukan milik company tersebut.');
-      }
-
       const detailValidation = await validateDetails(trx, payload.details, existingRequest.id, payload.startDate, payload.endDate);
 
       if (!detailValidation.valid) {
@@ -487,10 +587,10 @@ router
 
       await trx('equipmentRequests').where('id', existingRequest.id).update({
         companyId,
-        divisionId,
+        divisionId: null,
         startDate: payload.startDate,
         endDate: payload.endDate,
-        purpose: payload.purpose,
+        purpose: payload.divisionName,
         notes: payload.notes,
         updatedAt: now,
       });
@@ -526,67 +626,10 @@ router
   /**
    * DELETE /equipment-request/:uuid
    *
-   * Soft delete. Only DRAFT requests may be deleted.
+   * Soft delete is disabled because request is submitted immediately on create.
    */
-  .delete('/:uuid', authorization('EQUIPMENT_REQUEST.DELETE'), async (req, res) => {
-    const trx = await db.transaction();
-
-    try {
-      const access = await getRequestAccess(req);
-      const equipmentRequest = await findRequestForUpdate(trx, req.params.uuid, access);
-
-      if (!equipmentRequest) {
-        await trx.rollback();
-
-        return res.incomplete('Equipment request tidak ditemukan.');
-      }
-
-      if (Boolean(equipmentRequest.approvalLocked)) {
-        await trx.rollback();
-
-        return res.incomplete('Equipment request sudah dikunci dan tidak dapat dihapus.');
-      }
-
-      if (equipmentRequest.status !== STATUS_DRAFT) {
-        await trx.rollback();
-
-        return res.incomplete('Hanya equipment request berstatus DRAFT yang dapat dihapus.');
-      }
-
-      const now = db.fn.now();
-
-      await trx('equipmentRequestDetails').where('requestId', equipmentRequest.id).whereNull('deletedAt').update({
-        isActive: false,
-        updatedAt: now,
-        deletedAt: now,
-      });
-
-      await trx('equipmentRequests').where('id', equipmentRequest.id).update({
-        isActive: false,
-        updatedAt: now,
-        deletedAt: now,
-      });
-
-      await insertRequestHistory(trx, {
-        requestId: equipmentRequest.id,
-        activity: 'DELETE',
-        description: `Equipment request ${equipmentRequest.requestNo} dihapus.`,
-        userId: access.user.id,
-        createdAt: now,
-      });
-
-      await trx.commit();
-
-      return res.success({
-        uuid: equipmentRequest.uuid,
-      });
-    } catch (error) {
-      await trx.rollback();
-
-      console.error('DELETE /equipment-request/:uuid error:', error);
-
-      return res.fail(error.message || 'Failed to delete equipment request.');
-    }
+  .delete('/:uuid', authorization('EQUIPMENT_REQUEST.DELETE'), async (_req, res) => {
+    return res.incomplete('Equipment request yang sudah dikirim untuk approval tidak dapat dihapus.');
   })
 
   /**
@@ -598,15 +641,6 @@ router
    */
   .post('/:uuid/action', async (req, res) => {
     return executeRequestAction(req, res, req.body?.actionCode);
-  })
-
-  /**
-   * POST /equipment-request/:uuid/submit
-   *
-   * Backward-compatible alias for actionCode SUBMIT.
-   */
-  .post('/:uuid/submit', authorization('EQUIPMENT_REQUEST.SUBMIT'), async (req, res) => {
-    return executeRequestAction(req, res, ACTION_SUBMIT);
   });
 
 router.get('/:uuid/attachments', authorization(REQUEST_ATTACHMENT_READ_PERMISSIONS, { requireAll: false }), async (req, res) => {
@@ -656,7 +690,12 @@ router.post(
       const access = await getRequestAccess(req, trx);
       const equipmentRequest = await findRequestForUpdate(trx, req.params.uuid, access);
       if (!equipmentRequest) throw new Error('Equipment request tidak ditemukan atau tidak dapat diubah.');
-      if (!equipmentRequest.statusAllowEdit) throw new Error('Attachment hanya dapat diubah saat request masih editable.');
+      if (!isHolderAccess(access) && Number(equipmentRequest.requestBy) !== Number(access.user.id)) {
+        throw new Error('Attachment hanya dapat diubah oleh requestor yang membuat request.');
+      }
+      if (equipmentRequest.approvalLocked || !equipmentRequest.statusAllowEdit) {
+        throw new Error('Attachment hanya dapat diubah saat request masih editable.');
+      }
       const countRow = await trx('fileAttachments')
         .where({ moduleCode: REQUEST_ATTACHMENT_MODULE, referenceUuid: equipmentRequest.uuid, documentType: REQUEST_ATTACHMENT_DOCUMENT_TYPE, isActive: true })
         .whereNull('deletedAt')
@@ -723,7 +762,13 @@ router.delete('/:uuid/attachments/:attachmentUuid', authorization('EQUIPMENT_REQ
   try {
     const access = await getRequestAccess(req);
     const equipmentRequest = await findRequestByUuid(req.params.uuid, access);
-    if (!equipmentRequest || !equipmentRequest.statusAllowEdit) return res.incomplete('Attachment tidak dapat dihapus pada status request saat ini.');
+    if (!equipmentRequest) return res.incomplete('Equipment request tidak ditemukan.');
+    if (!isHolderAccess(access) && Number(equipmentRequest.requestBy) !== Number(access.user.id)) {
+      return res.unauthorized('Attachment hanya dapat diubah oleh requestor yang membuat request.');
+    }
+    if (equipmentRequest.approvalLocked || !equipmentRequest.statusAllowEdit) {
+      return res.incomplete('Attachment tidak dapat dihapus pada status request saat ini.');
+    }
     const updated = await db('fileAttachments')
       .where({
         uuid: req.params.attachmentUuid,
@@ -804,34 +849,6 @@ async function executeRequestAction(req, res, forcedActionCode = null) {
       await trx.rollback();
 
       return res.incomplete('Remarks wajib diisi untuk action ini.');
-    }
-
-    if (actionCode === ACTION_SUBMIT) {
-      const activeDetails = await trx('equipmentRequestDetails')
-        .where('requestId', equipmentRequest.id)
-        .where('isActive', true)
-        .whereNull('deletedAt')
-        .select(['id', 'equipmentUnitId', 'requiredCapacityValue', 'requiredCapacityUnit']);
-
-      if (activeDetails.length === 0) {
-        await trx.rollback();
-
-        return res.incomplete('Equipment request harus memiliki minimal satu detail sebelum disubmit.');
-      }
-
-      if (activeDetails.some((detail) => !detail.equipmentUnitId || Number(detail.requiredCapacityValue) <= 0 || !detail.requiredCapacityUnit)) {
-        await trx.rollback();
-
-        return res.incomplete('Semua detail harus memiliki equipment unit dan kebutuhan kapasitas.');
-      }
-
-      const approvalGeneration = await generateRequestApprovals(trx, equipmentRequest);
-
-      if (!approvalGeneration.valid) {
-        await trx.rollback();
-
-        return res.incomplete(approvalGeneration.message);
-      }
     }
 
     const approvalResult = await processPendingApproval(trx, {
@@ -934,9 +951,6 @@ async function findRequestByUuid(uuid, access, trx = db) {
     .leftJoin('companies as company', function () {
       this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
     })
-    .leftJoin('divisions as division', function () {
-      this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
-    })
     .leftJoin('users as requester', function () {
       this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
     })
@@ -951,10 +965,7 @@ async function findRequestByUuid(uuid, access, trx = db) {
       'company.uuid as companyUuid',
       'company.code as companyCode',
       'company.name as companyName',
-      'request.divisionId',
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
       'request.requestBy',
       'requester.uuid as requestByUuid',
       'requester.fullName as requestByName',
@@ -988,7 +999,12 @@ async function findRequestForUpdate(trx, uuid, access) {
     .leftJoin('equipmentRequestStatuses as requestStatus', function () {
       this.on('requestStatus.code', '=', 'request.status').andOnVal('requestStatus.isActive', '=', 1).andOnNull('requestStatus.deletedAt');
     })
-    .select(['request.*', 'requestStatus.allowEdit as statusAllowEdit', 'requestStatus.isTerminal as statusIsTerminal'])
+    .select([
+      'request.*',
+      trx.raw("DATE_FORMAT(request.startDate, '%Y-%m-%d %H:%i:%s') as originalStartDate"),
+      'requestStatus.allowEdit as statusAllowEdit',
+      'requestStatus.isTerminal as statusIsTerminal',
+    ])
     .where('request.uuid', uuid)
     .whereNull('request.deletedAt')
     .forUpdate();
@@ -1247,15 +1263,31 @@ function buildActionHistoryDescription({ transition, remarks, reviewSchedule, sc
   return remarks || `${transition.actionName}: ${transition.fromStatusCode} menjadi ${transition.toStatusCode}.`;
 }
 
+function getCurrentMinuteDateTime() {
+  const timeZone = process.env.APP_TIMEZONE || 'Asia/Jakarta';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}`;
+}
+
 function normalizePayload(payload = {}) {
   const rawDetails = Array.isArray(payload.details) ? payload.details : [];
 
   return {
     companyUuid: normalizeNullableString(payload.companyUuid),
-    divisionUuid: normalizeNullableString(payload.divisionUuid),
+    divisionName: normalizeNullableString(payload.divisionName),
     startDate: normalizeDate(payload.startDate),
     endDate: normalizeDate(payload.endDate),
-    purpose: normalizeNullableString(payload.purpose),
     notes: normalizeNullableString(payload.notes),
     details: rawDetails.map((detail) => ({
       uuid: normalizeNullableString(detail?.uuid),
@@ -1270,18 +1302,34 @@ function normalizePayload(payload = {}) {
   };
 }
 
-function validatePayload(payload) {
+function validatePayload(payload, options = {}) {
   if (!payload.startDate) {
     return {
       valid: false,
-      message: 'Start date dan waktu wajib diisi dengan format YYYY-MM-DD HH:mm.',
+      message: 'Start date dan waktu wajib diisi.',
+    };
+  }
+
+  const originalStartDate = normalizeDate(options.originalStartDate);
+
+  if (originalStartDate) {
+    if (payload.startDate < originalStartDate) {
+      return {
+        valid: false,
+        message: 'Start date dan waktu tidak boleh lebih kecil dari start date request sebelumnya.',
+      };
+    }
+  } else if (payload.startDate < getCurrentMinuteDateTime()) {
+    return {
+      valid: false,
+      message: 'Start date dan waktu tidak boleh lebih kecil dari waktu request.',
     };
   }
 
   if (!payload.endDate) {
     return {
       valid: false,
-      message: 'End date dan waktu wajib diisi dengan format YYYY-MM-DD HH:mm.',
+      message: 'End date dan waktu wajib diisi.',
     };
   }
 
@@ -1292,10 +1340,17 @@ function validatePayload(payload) {
     };
   }
 
-  if (payload.purpose && payload.purpose.length > 65535) {
+  if (!payload.divisionName) {
     return {
       valid: false,
-      message: 'Purpose terlalu panjang.',
+      message: 'Division wajib diisi.',
+    };
+  }
+
+  if (payload.divisionName.length > 65535) {
+    return {
+      valid: false,
+      message: 'Division terlalu panjang.',
     };
   }
 
@@ -1306,63 +1361,14 @@ function validatePayload(payload) {
     };
   }
 
-  if (!Array.isArray(payload.details) || payload.details.length === 0) {
+  if (!Array.isArray(payload.details) || !payload.details.length) {
     return {
       valid: false,
-      message: 'Equipment request harus memiliki minimal satu detail.',
+      message: 'Minimal satu equipment detail wajib diisi.',
     };
   }
 
-  for (let index = 0; index < payload.details.length; index += 1) {
-    const detail = payload.details[index];
-    const rowNumber = index + 1;
-
-    if (!detail.equipmentCategoryId) {
-      return {
-        valid: false,
-        message: `Equipment category pada detail baris ${rowNumber} wajib diisi.`,
-      };
-    }
-
-    if (!detail.equipmentUnitId) {
-      return {
-        valid: false,
-        message: `Equipment unit pada detail baris ${rowNumber} wajib diisi.`,
-      };
-    }
-
-    if (!detail.requiredCapacityValue) {
-      return {
-        valid: false,
-        message: `Required capacity value pada detail baris ${rowNumber} ` + 'wajib lebih dari 0.',
-      };
-    }
-
-    if (!detail.requiredCapacityUnit) {
-      return {
-        valid: false,
-        message: `Required capacity unit pada detail baris ${rowNumber} wajib diisi.`,
-      };
-    }
-
-    if (detail.requiredCapacityUnit.length > 50) {
-      return {
-        valid: false,
-        message: `Required capacity unit pada detail baris ${rowNumber} ` + 'maksimal 50 karakter.',
-      };
-    }
-
-    if (detail.rate !== null && detail.rate < 0) {
-      return {
-        valid: false,
-        message: `Rate pada detail baris ${rowNumber} tidak boleh negatif.`,
-      };
-    }
-  }
-
-  return {
-    valid: true,
-  };
+  return { valid: true };
 }
 
 async function validateEquipmentUnitAvailability(trx, { equipmentUnitId, requestId = null, startDate, endDate }) {
@@ -1372,19 +1378,20 @@ async function validateEquipmentUnitAvailability(trx, { equipmentUnitId, request
     .where('assignment.isActive', true)
     .whereNull('assignment.deletedAt')
     .whereNull('requestDetail.deletedAt')
-    .whereNotIn('assignment.statusCode', ['CANCELLED'])
+    .whereNotIn('assignment.statusCode', ['CANCELLED', 'STOPPED'])
     .where('assignment.plannedStartDate', '<=', endDate)
-    .andWhere((builder) => {
-      builder.whereNull('assignment.actualEndDate').orWhereRaw(
-        `
-            GREATEST(
-              assignment.plannedEndDate,
-              assignment.actualEndDate
-            ) >= ?
-          `,
-        [startDate]
-      );
-    });
+    .andWhereRaw(
+      `
+        COALESCE(
+          GREATEST(
+            assignment.plannedEndDate,
+            assignment.actualEndDate
+          ),
+          assignment.plannedEndDate
+        ) >= ?
+      `,
+      [startDate]
+    );
 
   if (requestId) {
     query.andWhere('requestDetail.requestId', '!=', requestId);
@@ -1580,16 +1587,6 @@ async function resolveCompanyId(trx, companyUuid, access, existingCompanyId = nu
   const company = await trx('companies').where('uuid', companyUuid).where('isActive', true).whereNull('deletedAt').first('id');
 
   return company?.id || null;
-}
-
-async function resolveDivisionId(trx, divisionUuid, companyId) {
-  if (!divisionUuid) {
-    return null;
-  }
-
-  const division = await trx('divisions').where('uuid', divisionUuid).where('companyId', companyId).where('isActive', true).whereNull('deletedAt').first('id');
-
-  return division?.id || null;
 }
 
 async function insertRequestDetails(trx, requestId, details, now) {

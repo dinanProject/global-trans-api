@@ -5,14 +5,10 @@ const { randomUUID } = require('crypto');
 
 const router = express.Router();
 
-const {
-  authenticate: authentication,
-  authorize: authorization,
-} = require('../../modules/access/access.middleware');
+const { authenticate: authentication, authorize: authorization } = require('../../modules/access/access.middleware');
 const db = require('../../lib/db')();
 
 const HOLDER_COMPANY_TYPE = 1;
-const GLOBAL_APPROVER_ROLE_CODE = 'GLOBAL_ADMIN';
 
 const REQUESTER_PERMISSION_CODES = [
   'AUTH.LOGIN',
@@ -21,7 +17,6 @@ const REQUESTER_PERMISSION_CODES = [
   'EQUIPMENT_REQUEST.CREATE',
   'EQUIPMENT_REQUEST.UPDATE',
   'EQUIPMENT_REQUEST.DELETE',
-  'EQUIPMENT_REQUEST.SUBMIT',
 ];
 
 const CLIENT_APPROVER_PERMISSION_CODES = [
@@ -45,17 +40,9 @@ router.use(authentication);
 router
   .get(
     '/',
-    authorization(
-      [
-        'COMPANY.VIEW',
-        'EQUIPMENT_REQUEST.VIEW',
-        'EQUIPMENT_REQUEST.CREATE',
-        'EQUIPMENT_REQUEST.UPDATE',
-      ],
-      {
-        requireAll: false,
-      }
-    ),
+    authorization(['COMPANY.VIEW', 'EQUIPMENT_REQUEST.VIEW', 'EQUIPMENT_REQUEST.CREATE', 'EQUIPMENT_REQUEST.UPDATE'], {
+      requireAll: false,
+    }),
     async (req, res) => {
       try {
         const { search, type, isActive } = req.query;
@@ -169,10 +156,7 @@ router
         return res.incomplete('Company type tidak valid.');
       }
 
-      const duplicateCode = await trx('companies')
-        .whereRaw('UPPER(code) = ?', [payload.code])
-        .whereNull('deletedAt')
-        .first('id');
+      const duplicateCode = await trx('companies').whereRaw('UPPER(code) = ?', [payload.code]).whereNull('deletedAt').first('id');
 
       if (duplicateCode) {
         await trx.rollback();
@@ -180,10 +164,7 @@ router
         return res.incomplete(`Company code "${payload.code}" sudah digunakan.`);
       }
 
-      const duplicateName = await trx('companies')
-        .whereRaw('UPPER(name) = ?', [payload.name.toUpperCase()])
-        .whereNull('deletedAt')
-        .first('id');
+      const duplicateName = await trx('companies').whereRaw('UPPER(name) = ?', [payload.name.toUpperCase()]).whereNull('deletedAt').first('id');
 
       if (duplicateName) {
         await trx.rollback();
@@ -255,10 +236,7 @@ router
     const trx = await db.transaction();
 
     try {
-      const existingCompany = await trx('companies')
-        .where('uuid', req.params.uuid)
-        .whereNull('deletedAt')
-        .first();
+      const existingCompany = await trx('companies').where('uuid', req.params.uuid).whereNull('deletedAt').first();
 
       if (!existingCompany) {
         await trx.rollback();
@@ -307,32 +285,20 @@ router
       }
 
       if (existingCompany.isActive && !payload.isActive) {
-        const activeDivision = await trx('divisions')
-          .where('companyId', existingCompany.id)
-          .where('isActive', true)
-          .whereNull('deletedAt')
-          .first('id');
+        const activeDivision = await trx('divisions').where('companyId', existingCompany.id).where('isActive', true).whereNull('deletedAt').first('id');
 
         if (activeDivision) {
           await trx.rollback();
 
-          return res.incomplete(
-            'Company tidak dapat dinonaktifkan karena masih memiliki division aktif.'
-          );
+          return res.incomplete('Company tidak dapat dinonaktifkan karena masih memiliki division aktif.');
         }
 
-        const activeUser = await trx('users')
-          .where('companyId', existingCompany.id)
-          .where('isActive', true)
-          .whereNull('deletedAt')
-          .first('id');
+        const activeUser = await trx('users').where('companyId', existingCompany.id).where('isActive', true).whereNull('deletedAt').first('id');
 
         if (activeUser) {
           await trx.rollback();
 
-          return res.incomplete(
-            'Company tidak dapat dinonaktifkan karena masih memiliki user aktif.'
-          );
+          return res.incomplete('Company tidak dapat dinonaktifkan karena masih memiliki user aktif.');
         }
       }
 
@@ -373,10 +339,7 @@ router
     const trx = await db.transaction();
 
     try {
-      const company = await trx('companies')
-        .where('uuid', req.params.uuid)
-        .whereNull('deletedAt')
-        .first();
+      const company = await trx('companies').where('uuid', req.params.uuid).whereNull('deletedAt').first();
 
       if (!company) {
         await trx.rollback();
@@ -384,10 +347,7 @@ router
         return res.incomplete('Company tidak ditemukan.');
       }
 
-      const division = await trx('divisions')
-        .where('companyId', company.id)
-        .whereNull('deletedAt')
-        .first('id');
+      const division = await trx('divisions').where('companyId', company.id).whereNull('deletedAt').first('id');
 
       if (division) {
         await trx.rollback();
@@ -395,10 +355,7 @@ router
         return res.incomplete('Company tidak dapat dihapus karena masih digunakan oleh division.');
       }
 
-      const user = await trx('users')
-        .where('companyId', company.id)
-        .whereNull('deletedAt')
-        .first('id');
+      const user = await trx('users').where('companyId', company.id).whereNull('deletedAt').first('id');
 
       if (user) {
         await trx.rollback();
@@ -429,9 +386,7 @@ router
 async function findCompanyByUuid(uuid) {
   return db('companies as company')
     .leftJoin('sysLookups as companyType', function () {
-      this.on('companyType.lookupId', '=', 'company.type')
-        .andOnVal('companyType.lookupGroup', '=', 'company_type')
-        .andOnVal('companyType.isActive', '=', 1);
+      this.on('companyType.lookupId', '=', 'company.type').andOnVal('companyType.lookupGroup', '=', 'company_type').andOnVal('companyType.isActive', '=', 1);
     })
     .select([
       'company.id',
@@ -487,40 +442,12 @@ async function provisionCompanyEquipmentAccess(trx, { companyId, companyCode, co
 
   await ensureRolePermissions(trx, approverRoleId, CLIENT_APPROVER_PERMISSION_CODES, 'COMPANY');
 
-  const holderCompany = await trx('companies')
-    .where('type', HOLDER_COMPANY_TYPE)
-    .where('isActive', true)
-    .whereNull('deletedAt')
-    .orderBy('id', 'asc')
-    .first('id');
-
-  if (!holderCompany) {
-    throw new Error('Company holder Global Trans aktif tidak ditemukan.');
-  }
-
-  const globalApproverRole = await trx('roles')
-    .whereRaw('UPPER(code) = ?', [GLOBAL_APPROVER_ROLE_CODE])
-    .first('id');
-
-  if (!globalApproverRole) {
-    throw new Error(`Role ${GLOBAL_APPROVER_ROLE_CODE} tidak ditemukan.`);
-  }
-
   await ensureEquipmentApprovalFlow(trx, {
     requestCompanyId: companyId,
     approvalLevel: 1,
     companyId,
     roleId: approverRoleId,
     actorStage: 'CLIENT',
-    now,
-  });
-
-  await ensureEquipmentApprovalFlow(trx, {
-    requestCompanyId: companyId,
-    approvalLevel: 2,
-    companyId: holderCompany.id,
-    roleId: globalApproverRole.id,
-    actorStage: 'GTSI',
     now,
   });
 }
@@ -532,9 +459,7 @@ async function provisionCompanyEquipmentAccess(trx, { companyId, companyCode, co
 async function ensureRole(trx, { code, name, description, companyId, now }) {
   const normalizedCode = normalizeRequiredString(code).toUpperCase();
 
-  const existingRole = await trx('roles')
-    .whereRaw('UPPER(code) = ?', [normalizedCode])
-    .first(['id', 'companyId']);
+  const existingRole = await trx('roles').whereRaw('UPPER(code) = ?', [normalizedCode]).first(['id', 'companyId']);
 
   if (existingRole) {
     if (Number(existingRole.companyId) !== Number(companyId)) {
@@ -566,26 +491,19 @@ async function ensureRole(trx, { code, name, description, companyId, now }) {
  * oleh System Developer, kemudian memasangnya ke role.
  */
 async function ensureRolePermissions(trx, roleId, permissionCodes, dataScope) {
-  const permissions = await trx('permissions')
-    .whereIn('code', permissionCodes)
-    .select(['permissionId', 'code']);
+  const permissions = await trx('permissions').whereIn('code', permissionCodes).select(['permissionId', 'code']);
 
   const foundCodes = new Set(permissions.map((permission) => permission.code));
 
   const missingCodes = permissionCodes.filter((permissionCode) => !foundCodes.has(permissionCode));
 
   if (missingCodes.length > 0) {
-    throw new Error(
-      `Permission default belum tersedia: ${missingCodes.join(', ')}. Hubungi System Developer.`
-    );
+    throw new Error(`Permission default belum tersedia: ${missingCodes.join(', ')}. Hubungi System Developer.`);
   }
 
   const permissionIds = permissions.map((permission) => permission.permissionId);
 
-  const existingPermissionIds = await trx('rolePermissions')
-    .where('roleId', roleId)
-    .whereIn('permissionId', permissionIds)
-    .pluck('permissionId');
+  const existingPermissionIds = await trx('rolePermissions').where('roleId', roleId).whereIn('permissionId', permissionIds).pluck('permissionId');
 
   const existingPermissionSet = new Set(existingPermissionIds.map(Number));
 
@@ -612,10 +530,7 @@ async function ensureRolePermissions(trx, roleId, permissionCodes, dataScope) {
  * Jika flow pada level yang sama sudah ada, konfigurasi flow
  * tersebut disinkronkan, bukan membuat duplikat.
  */
-async function ensureEquipmentApprovalFlow(
-  trx,
-  { requestCompanyId, approvalLevel, companyId, roleId, actorStage, now }
-) {
+async function ensureEquipmentApprovalFlow(trx, { requestCompanyId, approvalLevel, companyId, roleId, actorStage, now }) {
   const existingFlow = await trx('equipmentApprovalFlows')
     .where('requestCompanyId', requestCompanyId)
     .where('approvalLevel', approvalLevel)

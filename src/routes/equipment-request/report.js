@@ -26,21 +26,8 @@ router.get('/filters', authorization('EQUIPMENT_REPORT.VIEW'), async (req, res) 
       else companyQuery.where('company.id', access.company.id);
     }
 
-    const divisionQuery = db('divisions as division')
-      .join('companies as company', 'company.id', 'division.companyId')
-      .select(['division.id', 'division.uuid', 'division.code', 'division.name', 'company.uuid as companyUuid'])
-      .where('division.isActive', 1)
-      .whereNull('division.deletedAt')
-      .whereNull('company.deletedAt');
-
-    if (!isHolderAccess(access)) {
-      if (!access.company?.id) divisionQuery.whereRaw('1 = 0');
-      else divisionQuery.where('division.companyId', access.company.id);
-    }
-
-    const [companies, divisions, categories, statuses] = await Promise.all([
+    const [companies, categories, statuses] = await Promise.all([
       companyQuery.orderBy('company.name', 'asc'),
-      divisionQuery.orderBy('division.name', 'asc'),
       db('equipmentCategories as category')
         .select(['category.id', 'category.uuid', 'category.code', 'category.name'])
         .where('category.isActive', 1)
@@ -53,7 +40,7 @@ router.get('/filters', authorization('EQUIPMENT_REPORT.VIEW'), async (req, res) 
         .orderBy('status.sortOrder', 'asc'),
     ]);
 
-    return res.success({ companies, divisions, categories, statuses });
+    return res.success({ companies, categories, statuses });
   } catch (error) {
     console.error('GET /equipment-request/report/filters error:', error);
     return res.fail(error.message || 'Failed to load report filters.');
@@ -73,9 +60,6 @@ router.get('/export', authorization('EQUIPMENT_REPORT.VIEW'), async (req, res) =
       })
       .leftJoin('companies as company', function () {
         this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
-      })
-      .leftJoin('divisions as division', function () {
-        this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
       })
       .leftJoin('users as requester', function () {
         this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
@@ -102,7 +86,7 @@ router.get('/export', authorization('EQUIPMENT_REPORT.VIEW'), async (req, res) =
         'requestStatus.name as requestStatusName',
         'request.notes as requestNotes',
         'company.name as companyName',
-        'division.name as divisionName',
+        'request.purpose as divisionName',
         'requester.fullName as requesterName',
         'category.name as equipmentCategoryName',
         'unit.unitCode',
@@ -123,7 +107,6 @@ router.get('/export', authorization('EQUIPMENT_REPORT.VIEW'), async (req, res) =
     if (filters.startDate) query.andWhere('request.requestDate', '>=', `${filters.startDate} 00:00:00`);
     if (filters.endDate) query.andWhere('request.requestDate', '<=', `${filters.endDate} 23:59:59`);
     if (filters.companyUuid) query.andWhere('company.uuid', filters.companyUuid);
-    if (filters.divisionUuid) query.andWhere('division.uuid', filters.divisionUuid);
     if (filters.status) query.andWhere('request.status', filters.status);
     if (filters.categoryUuid) query.andWhere('category.uuid', filters.categoryUuid);
 
@@ -221,7 +204,6 @@ function normalizeFilters(query = {}) {
     startDate: normalizeDate(query.startDate),
     endDate: normalizeDate(query.endDate),
     companyUuid: normalizeString(query.companyUuid),
-    divisionUuid: normalizeString(query.divisionUuid),
     status: normalizeString(query.status)?.toUpperCase() || null,
     categoryUuid: normalizeString(query.categoryUuid),
   };
@@ -238,6 +220,8 @@ function deriveOperationalStatus(record, now) {
   const requestCode = String(record.requestStatusCode || '').toUpperCase();
   const operationCode = String(record.operationStatusCode || '').toUpperCase();
 
+  if (operationCode === 'STOPPED' || requestCode === 'STOPPED') return 'Stopped';
+  if (operationCode === 'CANCELLED' || requestCode === 'CANCELLED') return 'Cancelled';
   if (operationCode === 'COMPLETED' || requestCode === 'COMPLETED') return 'Completed';
   if (requestCode === 'REJECTED') return 'Rejected';
   if (requestCode === 'DRAFT') return 'Draft';

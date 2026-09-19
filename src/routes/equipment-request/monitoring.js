@@ -20,9 +20,6 @@ async function findRequestByUuid(uuid, access, trx = db) {
     .leftJoin('companies as company', function () {
       this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
     })
-    .leftJoin('divisions as division', function () {
-      this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
-    })
     .leftJoin('users as requester', function () {
       this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
     })
@@ -37,10 +34,7 @@ async function findRequestByUuid(uuid, access, trx = db) {
       'company.uuid as companyUuid',
       'company.code as companyCode',
       'company.name as companyName',
-      'request.divisionId',
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
       'request.requestBy',
       'requester.uuid as requestByUuid',
       'requester.fullName as requestByName',
@@ -260,7 +254,6 @@ function normalizePayload(payload = {}) {
 
   return {
     companyUuid: normalizeNullableString(payload.companyUuid),
-    divisionUuid: normalizeNullableString(payload.divisionUuid),
     startDate: normalizeDate(payload.startDate),
     endDate: normalizeDate(payload.endDate),
     purpose: normalizeNullableString(payload.purpose),
@@ -406,15 +399,6 @@ async function resolveCompanyId(trx, companyUuid, access, existingCompanyId = nu
   return company?.id || null;
 }
 
-async function resolveDivisionId(trx, divisionUuid, companyId) {
-  if (!divisionUuid) {
-    return null;
-  }
-
-  const division = await trx('divisions').where('uuid', divisionUuid).where('companyId', companyId).where('isActive', true).whereNull('deletedAt').first('id');
-
-  return division?.id || null;
-}
 
 async function insertRequestDetails(trx, requestId, details, now) {
   const rows = details.map((detail) => ({
@@ -980,7 +964,7 @@ async function validateEquipmentSchedule(trx, payload) {
     .where('equipmentUnitId', payload.equipmentUnitId)
     .where('isActive', true)
     .whereNull('deletedAt')
-    .whereNotIn('statusCode', ['COMPLETED', 'CANCELLED'])
+    .whereNotIn('statusCode', ['COMPLETED', 'CANCELLED', 'STOPPED'])
     .where('plannedStartDate', '<=', payload.plannedEndDate)
     .where('plannedEndDate', '>=', payload.plannedStartDate)
     .first('id');
@@ -1007,7 +991,7 @@ async function synchronizeRequestAssignmentStatus(trx, requestId) {
       .where('requestDetailId', detail.id)
       .where('isActive', true)
       .whereNull('deletedAt')
-      .whereNotIn('statusCode', ['CANCELLED'])
+      .whereNotIn('statusCode', ['CANCELLED', 'STOPPED'])
       .first('id');
 
     if (!assignment) {
@@ -1023,7 +1007,7 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
     .where('requestId', requestId)
     .where('isActive', true)
     .whereNull('deletedAt')
-    .whereNot('statusCode', 'CANCELLED')
+    .whereNotIn('statusCode', ['CANCELLED', 'STOPPED'])
     .select(['statusCode']);
 
   if (assignments.length === 0) {
@@ -1196,7 +1180,6 @@ function normalizeMonitoringFilters(query = {}) {
     valid: true,
     search: normalizeNullableString(query.search),
     companyUuid: normalizeNullableString(query.companyUuid),
-    divisionUuid: normalizeNullableString(query.divisionUuid),
     equipmentUuid: normalizeNullableString(query.equipmentUuid),
     status: normalizeNullableString(query.status)?.toUpperCase() || null,
     startDate,
@@ -1207,16 +1190,12 @@ function normalizeMonitoringFilters(query = {}) {
 function applyMonitoringFilters(query, filters, aliases = {}) {
   const assignmentAlias = aliases.assignment || 'assignment';
   const companyAlias = aliases.company || 'company';
-  const divisionAlias = aliases.division || 'division';
   const equipmentAlias = aliases.equipment || 'equipmentUnit';
 
   if (filters.companyUuid) {
     query.andWhere(`${companyAlias}.uuid`, filters.companyUuid);
   }
 
-  if (filters.divisionUuid) {
-    query.andWhere(`${divisionAlias}.uuid`, filters.divisionUuid);
-  }
 
   if (filters.equipmentUuid) {
     query.andWhere(`${equipmentAlias}.uuid`, filters.equipmentUuid);
@@ -1241,9 +1220,6 @@ function buildMonitoringAssignmentQuery(trx = db) {
     })
     .leftJoin('companies as company', function () {
       this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
-    })
-    .leftJoin('divisions as division', function () {
-      this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
     })
     .whereNull('assignment.deletedAt')
     .whereNull('request.deletedAt')
@@ -1285,9 +1261,7 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
       'company.code as companyCode',
       'company.name as companyName',
 
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
 
       'detail.uuid as requestDetailUuid',
 
@@ -1330,8 +1304,6 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
           .orWhere('request.requestNo', 'like', search)
           .orWhere('company.code', 'like', search)
           .orWhere('company.name', 'like', search)
-          .orWhere('division.code', 'like', search)
-          .orWhere('division.name', 'like', search)
           .orWhere('category.code', 'like', search)
           .orWhere('category.name', 'like', search);
       });
@@ -1347,7 +1319,7 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
           .whereRaw('activeAssignment.equipmentUnitId = equipmentUnit.id')
           .where('activeAssignment.isActive', true)
           .whereNull('activeAssignment.deletedAt')
-          .whereNot('activeAssignment.statusCode', 'CANCELLED')
+          .whereNotIn('activeAssignment.statusCode', ['CANCELLED', 'STOPPED'])
           .andWhere((builder) => {
             builder.whereNull('activeAssignment.actualEndDate').orWhereRaw(
               `
@@ -1465,7 +1437,6 @@ router.get('/overview', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, 
  *
  * Query:
  * - companyUuid
- * - divisionUuid
  * - startDate
  * - endDate
  */
@@ -1541,7 +1512,7 @@ router.get('/summary', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, r
           .whereRaw('activeAssignment.equipmentUnitId = equipmentUnit.id')
           .where('activeAssignment.isActive', true)
           .whereNull('activeAssignment.deletedAt')
-          .whereNot('activeAssignment.statusCode', 'CANCELLED')
+          .whereNotIn('activeAssignment.statusCode', ['CANCELLED', 'STOPPED'])
           .andWhere((builder) => {
             builder.whereNull('activeAssignment.actualEndDate').orWhereRaw(
               `
@@ -1581,7 +1552,6 @@ router.get('/summary', authorization('EQUIPMENT_MONITORING.VIEW'), async (req, r
  * Query:
  * - search
  * - companyUuid
- * - divisionUuid
  * - equipmentUuid
  * - status
  * - startDate
@@ -1622,9 +1592,7 @@ router.get('/assignments', authorization('EQUIPMENT_MONITORING.VIEW'), async (re
       'company.code as companyCode',
       'company.name as companyName',
 
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
 
       'detail.uuid as requestDetailUuid',
 
@@ -1658,8 +1626,6 @@ router.get('/assignments', authorization('EQUIPMENT_MONITORING.VIEW'), async (re
           .orWhere('request.requestNo', 'like', search)
           .orWhere('company.code', 'like', search)
           .orWhere('company.name', 'like', search)
-          .orWhere('division.code', 'like', search)
-          .orWhere('division.name', 'like', search)
           .orWhere('category.code', 'like', search)
           .orWhere('category.name', 'like', search);
       });
@@ -1816,9 +1782,7 @@ async function findMonitoringAssignmentByUuid(uuid, access, trx = db) {
       'company.code as companyCode',
       'company.name as companyName',
 
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
 
       'detail.uuid as requestDetailUuid',
 

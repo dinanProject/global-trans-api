@@ -11,6 +11,8 @@ const {
   enqueueOperationNotifications,
   enqueueOperationStartedNotifications,
   enqueueOperationCompletedNotifications,
+  enqueueOperationCancelledNotifications,
+  enqueueOperationStoppedNotifications,
 } = require('../../services/equipment-request/email');
 const { deactivateOperationMenuNotifications } = require('../../services/equipment-request/notification');
 
@@ -21,11 +23,13 @@ const STATUS_ASSIGNED = 'ASSIGNED';
 const STATUS_IN_PROGRESS = 'IN_PROGRESS';
 const STATUS_PARTIALLY_COMPLETED = 'PARTIALLY_COMPLETED';
 const STATUS_COMPLETED = 'COMPLETED';
+const STATUS_STOPPED = 'STOPPED';
 
 const OPERATION_RECORD_STATUS_ASSIGNED = 'ASSIGNED';
 const OPERATION_RECORD_STATUS_IN_OPERATION = 'IN_OPERATION';
 const OPERATION_RECORD_STATUS_COMPLETED = 'COMPLETED';
 const OPERATION_RECORD_STATUS_CANCELLED = 'CANCELLED';
+const OPERATION_RECORD_STATUS_STOPPED = 'STOPPED';
 
 router.use(authentication);
 
@@ -33,9 +37,6 @@ async function findRequestByUuid(uuid, access, trx = db) {
   const query = trx('equipmentRequests as request')
     .leftJoin('companies as company', function () {
       this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
-    })
-    .leftJoin('divisions as division', function () {
-      this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
     })
     .leftJoin('users as requester', function () {
       this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
@@ -51,10 +52,7 @@ async function findRequestByUuid(uuid, access, trx = db) {
       'company.uuid as companyUuid',
       'company.code as companyCode',
       'company.name as companyName',
-      'request.divisionId',
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
       'request.requestBy',
       'requester.uuid as requestByUuid',
       'requester.fullName as requestByName',
@@ -291,7 +289,6 @@ function normalizePayload(payload = {}) {
 
   return {
     companyUuid: normalizeNullableString(payload.companyUuid),
-    divisionUuid: normalizeNullableString(payload.divisionUuid),
     startDate: normalizeDate(payload.startDate),
     endDate: normalizeDate(payload.endDate),
     purpose: normalizeNullableString(payload.purpose),
@@ -430,16 +427,6 @@ async function resolveCompanyId(trx, companyUuid, access, existingCompanyId = nu
   const company = await trx('companies').where('uuid', companyUuid).where('isActive', true).whereNull('deletedAt').first('id');
 
   return company?.id || null;
-}
-
-async function resolveDivisionId(trx, divisionUuid, companyId) {
-  if (!divisionUuid) {
-    return null;
-  }
-
-  const division = await trx('divisions').where('uuid', divisionUuid).where('companyId', companyId).where('isActive', true).whereNull('deletedAt').first('id');
-
-  return division?.id || null;
 }
 
 async function insertRequestDetails(trx, requestId, details, now) {
@@ -1401,7 +1388,7 @@ router.post('/:uuid/start-all', authorization('EQUIPMENT_REQUEST.START_OPERATION
       .where('isActive', true)
       .whereNull('deletedAt')
       .forUpdate()
-      .select(['id', 'uuid', 'statusCode']);
+      .select(['id', 'uuid', 'statusCode', 'plannedStartDate', 'plannedEndDate']);
 
     if (operations.length !== operationUuids.length) {
       await trx.rollback();
@@ -1469,6 +1456,220 @@ router.post('/:uuid/:operationUuid/complete', authorization('EQUIPMENT_REQUEST.C
   return updateOperationStatus(req, res, OPERATION_RECORD_STATUS_COMPLETED);
 });
 
+router.post('/:uuid/:operationUuid/stop', authorization('EQUIPMENT_REQUEST.CANCEL'), async (req, res) => {
+  const trx = await db.transaction();
+
+  try {
+    const access = await getRequestAccess(req);
+    const equipmentRequest = await findRequestForUpdate(trx, req.params.uuid, access);
+
+    if (!equipmentRequest) {
+      await trx.rollback();
+      return res.incomplete('Equipment request tidak ditemukan.');
+    }
+
+    const operation = await trx('equipmentOperations')
+      .where('uuid', req.params.operationUuid)
+      .where('requestId', equipmentRequest.id)
+      .where('isActive', true)
+      .whereNull('deletedAt')
+      .forUpdate()
+      .select([
+        'equipmentOperations.*',
+        trx.raw("DATE_FORMAT(plannedStartDate, '%Y-%m-%d %H:%i:%s') as plannedStartDateText"),
+        trx.raw("DATE_FORMAT(plannedEndDate, '%Y-%m-%d %H:%i:%s') as plannedEndDateText"),
+      ])
+      .first();
+
+    if (!operation) {
+      await trx.rollback();
+      return res.incomplete('Equipment operation tidak ditemukan.');
+    }
+
+    if (![OPERATION_RECORD_STATUS_ASSIGNED, OPERATION_RECORD_STATUS_IN_OPERATION].includes(operation.statusCode)) {
+      await trx.rollback();
+      return res.incomplete(`Operation berstatus ${operation.statusCode} tidak dapat dihentikan.`);
+    }
+
+    const plannedStartDate = normalizeDate(operation.plannedStartDateText);
+    const plannedEndDate = normalizeDate(operation.plannedEndDateText);
+    const currentDateTime = getCurrentMinuteDateTime();
+
+    if (!plannedStartDate || !plannedEndDate) {
+      await trx.rollback();
+      return res.incomplete('Planned period operation tidak valid.');
+    }
+
+    if (currentDateTime < plannedStartDate) {
+      await trx.rollback();
+      return res.incomplete('Operation belum memasuki planned period. Gunakan Cancel Reservation.');
+    }
+
+    if (currentDateTime > plannedEndDate) {
+      await trx.rollback();
+      return res.incomplete('Planned period operation sudah berakhir. Gunakan Complete Request.');
+    }
+
+    const stoppedRequestStatus = await trx('equipmentRequestStatuses')
+      .where('code', STATUS_STOPPED)
+      .where('isActive', true)
+      .whereNull('deletedAt')
+      .first('code');
+
+    if (!stoppedRequestStatus) {
+      await trx.rollback();
+      return res.incomplete('Status STOPPED belum tersedia atau tidak aktif. Jalankan migration STOPPED terlebih dahulu.');
+    }
+
+    const now = db.fn.now();
+
+    await trx('equipmentOperations')
+      .where('id', operation.id)
+      .update({
+        statusCode: OPERATION_RECORD_STATUS_STOPPED,
+        actualStartDate: operation.actualStartDate || plannedStartDate || now,
+        actualEndDate: now,
+        releasedBy: access.user.id,
+        releasedAt: now,
+        updatedAt: now,
+      });
+
+    const operationalStatusResult = await synchronizeRequestOperationalStatus(trx, equipmentRequest.id);
+
+    await insertRequestHistory(trx, {
+      requestId: equipmentRequest.id,
+      activity: 'STOP_OPERATION',
+      description: `Operation ${operation.uuid} dihentikan selama planned period.`,
+      userId: access.user.id,
+      createdAt: now,
+    });
+
+    if (operationalStatusResult.statusChanged && operationalStatusResult.statusCode === STATUS_STOPPED) {
+      await deactivateOperationMenuNotifications(trx, equipmentRequest);
+    }
+
+    await enqueueOperationStoppedNotifications(trx, {
+      requestId: equipmentRequest.id,
+      operationUuid: operation.uuid,
+      actionUserId: access.user.id,
+    });
+
+    await trx.commit();
+
+    const updatedOperation = await findOperationByUuid(operation.uuid);
+    return res.success(updatedOperation);
+  } catch (error) {
+    await trx.rollback();
+    console.error('POST /equipment-request/operations/:uuid/:operationUuid/stop error:', error);
+    return res.fail(error.message || 'Failed to stop equipment operation.');
+  }
+});
+
+router.post('/:uuid/cancel-reservation', authorization('EQUIPMENT_REQUEST.CANCEL'), async (req, res) => {
+  const trx = await db.transaction();
+
+  try {
+    const access = await getRequestAccess(req);
+    const equipmentRequest = await findRequestForUpdate(trx, req.params.uuid, access);
+
+    if (!equipmentRequest) {
+      await trx.rollback();
+      return res.incomplete('Equipment request tidak ditemukan.');
+    }
+
+    if (![STATUS_APPROVED, STATUS_ASSIGNED].includes(equipmentRequest.status)) {
+      await trx.rollback();
+      return res.incomplete(`Reservation tidak dapat dibatalkan dari status ${equipmentRequest.status}.`);
+    }
+
+    const operations = await trx('equipmentOperations')
+      .where('requestId', equipmentRequest.id)
+      .where('isActive', true)
+      .whereNull('deletedAt')
+      .whereNotIn('statusCode', [OPERATION_RECORD_STATUS_CANCELLED, OPERATION_RECORD_STATUS_STOPPED])
+      .forUpdate()
+      .select([
+        'id',
+        'uuid',
+        'statusCode',
+        trx.raw("DATE_FORMAT(plannedStartDate, '%Y-%m-%d %H:%i:%s') as plannedStartDateText"),
+        trx.raw("DATE_FORMAT(plannedEndDate, '%Y-%m-%d %H:%i:%s') as plannedEndDateText"),
+      ]);
+
+    if (operations.length === 0) {
+      await trx.rollback();
+      return res.incomplete('Reservation aktif tidak ditemukan.');
+    }
+
+    const invalidOperation = operations.find((operation) => operation.statusCode !== OPERATION_RECORD_STATUS_ASSIGNED);
+
+    if (invalidOperation) {
+      await trx.rollback();
+      return res.incomplete(`Reservation tidak dapat dibatalkan karena operation ${invalidOperation.uuid} berstatus ${invalidOperation.statusCode}.`);
+    }
+
+    const currentDateTime = getCurrentMinuteDateTime();
+    const startedOperation = operations.find((operation) => {
+      const plannedStartDate = normalizeDate(operation.plannedStartDateText);
+      return plannedStartDate && currentDateTime >= plannedStartDate;
+    });
+
+    if (startedOperation) {
+      await trx.rollback();
+      return res.incomplete('Reservation sudah memasuki planned period. Gunakan Stop Operation untuk menghentikan operasi.');
+    }
+
+    const cancelledStatus = await trx('equipmentRequestStatuses').where('code', 'CANCELLED').where('isActive', true).whereNull('deletedAt').first('code');
+
+    if (!cancelledStatus) {
+      await trx.rollback();
+      return res.incomplete('Status CANCELLED belum tersedia atau tidak aktif.');
+    }
+
+    const now = db.fn.now();
+    const operationIds = operations.map((operation) => operation.id);
+
+    await trx('equipmentOperations').whereIn('id', operationIds).update({
+      statusCode: OPERATION_RECORD_STATUS_CANCELLED,
+      releasedBy: access.user.id,
+      releasedAt: now,
+      updatedAt: now,
+    });
+
+    await trx('equipmentRequests').where('id', equipmentRequest.id).update({
+      status: 'CANCELLED',
+      updatedAt: now,
+    });
+
+    await insertRequestHistory(trx, {
+      requestId: equipmentRequest.id,
+      activity: 'CANCEL_RESERVATION',
+      description: `${operations.length} equipment reservation dibatalkan sebelum operasi dimulai.`,
+      userId: access.user.id,
+      createdAt: now,
+    });
+
+    await deactivateOperationMenuNotifications(trx, equipmentRequest);
+
+    await enqueueOperationCancelledNotifications(trx, {
+      requestId: equipmentRequest.id,
+      actionUserId: access.user.id,
+    });
+
+    await trx.commit();
+
+    return res.success({
+      requestUuid: equipmentRequest.uuid,
+      status: 'CANCELLED',
+      cancelledOperationCount: operations.length,
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('POST /equipment-request/operations/:uuid/cancel-reservation error:', error);
+    return res.fail(error.message || 'Failed to cancel equipment reservation.');
+  }
+});
+
 async function updateOperationStatus(req, res, destinationStatus) {
   const trx = await db.transaction();
 
@@ -1489,6 +1690,7 @@ async function updateOperationStatus(req, res, destinationStatus) {
       .where('isActive', true)
       .whereNull('deletedAt')
       .forUpdate()
+      .select(['equipmentOperations.*', trx.raw("DATE_FORMAT(plannedStartDate, '%Y-%m-%d %H:%i:%s') as plannedStartDateText")])
       .first();
 
     if (!operation) {
@@ -1514,6 +1716,16 @@ async function updateOperationStatus(req, res, destinationStatus) {
           ? 'Equipment operation sudah diselesaikan.'
           : `Operation berstatus ${operation.statusCode} tidak dapat diselesaikan.`
       );
+    }
+
+    if (destinationStatus === OPERATION_RECORD_STATUS_COMPLETED) {
+      const plannedStartDate = normalizeDate(operation.plannedStartDateText);
+      const currentDateTime = getCurrentMinuteDateTime();
+
+      if (plannedStartDate && currentDateTime < plannedStartDate) {
+        await trx.rollback();
+        return res.incomplete('Operation belum memasuki planned period. Gunakan Cancel Reservation.');
+      }
     }
 
     const now = db.fn.now();
@@ -1742,18 +1954,25 @@ async function validateEquipmentSchedule(trx, payload) {
     .where('equipmentUnitId', payload.equipmentUnitId)
     .where('isActive', true)
     .whereNull('deletedAt')
-    .whereNotIn('statusCode', [OPERATION_RECORD_STATUS_CANCELLED])
+    .whereNotIn('statusCode', [OPERATION_RECORD_STATUS_CANCELLED, OPERATION_RECORD_STATUS_STOPPED])
     .where('plannedStartDate', '<=', payload.plannedEndDate)
     .andWhere((builder) => {
-      builder.whereNull('actualEndDate').orWhereRaw(
-        `
-            GREATEST(
-              plannedEndDate,
-              actualEndDate
+      builder
+        .where((activeOperation) => {
+          activeOperation.where('statusCode', OPERATION_RECORD_STATUS_IN_OPERATION).whereNull('actualEndDate');
+        })
+        .orWhereRaw(
+          `
+            COALESCE(
+              GREATEST(
+                plannedEndDate,
+                actualEndDate
+              ),
+              plannedEndDate
             ) >= ?
           `,
-        [payload.plannedStartDate]
-      );
+          [payload.plannedStartDate]
+        );
     })
     .first(['id', 'uuid', 'statusCode', 'plannedStartDate', 'plannedEndDate', 'actualEndDate']);
 
@@ -1794,7 +2013,7 @@ async function synchronizeRequestOperationStatus(trx, requestId) {
       this.on('operation.requestDetailId', '=', 'detail.id')
         .andOnVal('operation.isActive', '=', 1)
         .andOnNull('operation.deletedAt')
-        .andOnNotIn('operation.statusCode', [OPERATION_RECORD_STATUS_CANCELLED]);
+        .andOnNotIn('operation.statusCode', [OPERATION_RECORD_STATUS_CANCELLED, OPERATION_RECORD_STATUS_STOPPED]);
     })
     .where('detail.requestId', requestId)
     .where('detail.isActive', true)
@@ -1862,14 +2081,15 @@ async function synchronizeRequestOperationalStatus(trx, requestId) {
   }
 
   const completedCount = operations.filter((operation) => operation.statusCode === OPERATION_RECORD_STATUS_COMPLETED).length;
-
+  const stoppedCount = operations.filter((operation) => operation.statusCode === OPERATION_RECORD_STATUS_STOPPED).length;
+  const terminalCount = completedCount + stoppedCount;
   const hasInOperation = operations.some((operation) => operation.statusCode === OPERATION_RECORD_STATUS_IN_OPERATION);
 
   let nextStatusCode = request.status;
 
-  if (completedCount === operations.length) {
-    nextStatusCode = STATUS_COMPLETED;
-  } else if (completedCount > 0) {
+  if (terminalCount === operations.length) {
+    nextStatusCode = stoppedCount > 0 ? STATUS_STOPPED : STATUS_COMPLETED;
+  } else if (terminalCount > 0) {
     nextStatusCode = STATUS_PARTIALLY_COMPLETED;
   } else if (hasInOperation) {
     nextStatusCode = STATUS_IN_PROGRESS;
@@ -1907,6 +2127,21 @@ async function updateRequestStatusIfAvailable(trx, requestId, statusCode) {
   });
 }
 
+function getCurrentMinuteDateTime() {
+  const timeZone = process.env.APP_TIMEZONE || 'Asia/Jakarta';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}:00`;
+}
+
 function normalizeMonitoringFilters(query = {}) {
   const startDate = query.startDate ? normalizeDate(query.startDate) : null;
 
@@ -1936,19 +2171,14 @@ function normalizeMonitoringFilters(query = {}) {
   return {
     valid: true,
     companyUuid: normalizeNullableString(query.companyUuid),
-    divisionUuid: normalizeNullableString(query.divisionUuid),
     startDate,
     endDate,
   };
 }
 
-function applyMonitoringFilters(query, filters, requestAlias = 'request', companyAlias = 'company', divisionAlias = 'division') {
+function applyMonitoringFilters(query, filters, requestAlias = 'request', companyAlias = 'company') {
   if (filters.companyUuid) {
     query.andWhere(`${companyAlias}.uuid`, filters.companyUuid);
-  }
-
-  if (filters.divisionUuid) {
-    query.andWhere(`${divisionAlias}.uuid`, filters.divisionUuid);
   }
 
   if (filters.startDate) {

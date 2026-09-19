@@ -32,14 +32,11 @@ router.use(authentication);
 router.get('/', authorization('EQUIPMENT_APPROVAL.VIEW'), async (req, res) => {
   try {
     const access = await getRequestAccess(req);
-    const { search, status, companyUuid, divisionUuid, startDate, endDate, isActive } = req.query;
+    const { search, status, companyUuid, startDate, endDate, isActive } = req.query;
 
     const query = db('equipmentRequests as request')
       .leftJoin('companies as company', function () {
         this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
-      })
-      .leftJoin('divisions as division', function () {
-        this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
       })
       .leftJoin('users as requester', function () {
         this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
@@ -55,10 +52,7 @@ router.get('/', authorization('EQUIPMENT_APPROVAL.VIEW'), async (req, res) => {
         'company.uuid as companyUuid',
         'company.code as companyCode',
         'company.name as companyName',
-        'request.divisionId',
-        'division.uuid as divisionUuid',
-        'division.code as divisionCode',
-        'division.name as divisionName',
+        'request.purpose as divisionName',
         'request.requestBy',
         'requester.uuid as requestByUuid',
         'requester.fullName as requestByName',
@@ -90,8 +84,6 @@ router.get('/', authorization('EQUIPMENT_APPROVAL.VIEW'), async (req, res) => {
           .where('request.requestNo', 'like', normalizedSearch)
           .orWhere('company.code', 'like', normalizedSearch)
           .orWhere('company.name', 'like', normalizedSearch)
-          .orWhere('division.code', 'like', normalizedSearch)
-          .orWhere('division.name', 'like', normalizedSearch)
           .orWhere('requester.fullName', 'like', normalizedSearch)
           .orWhere('request.purpose', 'like', normalizedSearch)
           .orWhere('request.notes', 'like', normalizedSearch);
@@ -104,10 +96,6 @@ router.get('/', authorization('EQUIPMENT_APPROVAL.VIEW'), async (req, res) => {
 
     if (companyUuid) {
       query.andWhere('company.uuid', String(companyUuid).trim());
-    }
-
-    if (divisionUuid) {
-      query.andWhere('division.uuid', String(divisionUuid).trim());
     }
 
     if (startDate) {
@@ -585,11 +573,15 @@ async function validateFinalRequestAvailability(trx, { requestId, startDate, end
       .whereNot('assignmentDetail.requestId', requestId)
       .where('assignment.isActive', true)
       .whereNull('assignment.deletedAt')
-      .whereNotIn('assignment.statusCode', ['CANCELLED'])
+      .whereNotIn('assignment.statusCode', ['CANCELLED', 'STOPPED'])
       .where('assignment.plannedStartDate', '<=', endDate)
       .andWhere((builder) => {
-        builder.whereNull('assignment.actualEndDate').orWhereRaw(
-          `
+        builder
+          .where((activeOperation) => {
+            activeOperation.where('assignment.statusCode', 'IN_OPERATION').whereNull('assignment.actualEndDate');
+          })
+          .orWhereRaw(
+            `
               COALESCE(
                 GREATEST(
                   assignment.plannedEndDate,
@@ -598,8 +590,8 @@ async function validateFinalRequestAvailability(trx, { requestId, startDate, end
                 assignment.plannedEndDate
               ) >= ?
               `,
-          [startDate]
-        );
+            [startDate]
+          );
       })
       .select(['assignment.equipmentUnitId', 'assignment.statusCode', 'assignment.plannedStartDate', 'assignment.plannedEndDate', 'assignment.actualEndDate'])
       .orderBy('assignment.equipmentUnitId', 'asc')
@@ -665,9 +657,6 @@ async function findRequestByUuid(uuid, access, trx = db) {
     .leftJoin('companies as company', function () {
       this.on('company.id', '=', 'request.companyId').andOnNull('company.deletedAt');
     })
-    .leftJoin('divisions as division', function () {
-      this.on('division.id', '=', 'request.divisionId').andOnNull('division.deletedAt');
-    })
     .leftJoin('users as requester', function () {
       this.on('requester.id', '=', 'request.requestBy').andOnNull('requester.deletedAt');
     })
@@ -682,10 +671,7 @@ async function findRequestByUuid(uuid, access, trx = db) {
       'company.uuid as companyUuid',
       'company.code as companyCode',
       'company.name as companyName',
-      'request.divisionId',
-      'division.uuid as divisionUuid',
-      'division.code as divisionCode',
-      'division.name as divisionName',
+      'request.purpose as divisionName',
       'request.requestBy',
       'requester.uuid as requestByUuid',
       'requester.fullName as requestByName',
@@ -812,7 +798,7 @@ async function enrichRequestDetailsWithAvailability({ details, requestId, reques
       .whereNot('assignmentDetail.requestId', requestId)
       .where('assignment.isActive', true)
       .whereNull('assignment.deletedAt')
-      .whereNotIn('assignment.statusCode', ['CANCELLED'])
+      .whereNotIn('assignment.statusCode', ['CANCELLED', 'STOPPED'])
       .andWhereRaw(
         `
         COALESCE(
@@ -877,18 +863,25 @@ async function enrichRequestDetailsWithAvailability({ details, requestId, reques
       .whereNot('assignmentDetail.requestId', requestId)
       .where('assignment.isActive', true)
       .whereNull('assignment.deletedAt')
-      .whereNotIn('assignment.statusCode', ['CANCELLED'])
+      .whereNotIn('assignment.statusCode', ['CANCELLED', 'STOPPED'])
       .where('assignment.plannedStartDate', '<=', requestedEndDate)
       .andWhere((builder) => {
-        builder.whereNull('assignment.actualEndDate').orWhereRaw(
-          `
-            GREATEST(
-              assignment.plannedEndDate,
-              assignment.actualEndDate
-            ) >= ?
-          `,
-          [requestedStartDate]
-        );
+        builder
+          .where((activeOperation) => {
+            activeOperation.where('assignment.statusCode', 'IN_OPERATION').whereNull('assignment.actualEndDate');
+          })
+          .orWhereRaw(
+            `
+              COALESCE(
+                GREATEST(
+                  assignment.plannedEndDate,
+                  assignment.actualEndDate
+                ),
+                assignment.plannedEndDate
+              ) >= ?
+            `,
+            [requestedStartDate]
+          );
       })
       .select(['assignment.equipmentUnitId', 'assignment.statusCode', 'assignment.plannedStartDate', 'assignment.plannedEndDate', 'assignment.actualEndDate'])
       .orderBy('assignment.equipmentUnitId', 'asc')
@@ -1242,7 +1235,6 @@ function normalizePayload(payload = {}) {
 
   return {
     companyUuid: normalizeNullableString(payload.companyUuid),
-    divisionUuid: normalizeNullableString(payload.divisionUuid),
     startDate: normalizeDate(payload.startDate),
     endDate: normalizeDate(payload.endDate),
     purpose: normalizeNullableString(payload.purpose),
@@ -1420,16 +1412,6 @@ async function resolveCompanyId(trx, companyUuid, access, existingCompanyId = nu
   const company = await trx('companies').where('uuid', companyUuid).where('isActive', true).whereNull('deletedAt').first('id');
 
   return company?.id || null;
-}
-
-async function resolveDivisionId(trx, divisionUuid, companyId) {
-  if (!divisionUuid) {
-    return null;
-  }
-
-  const division = await trx('divisions').where('uuid', divisionUuid).where('companyId', companyId).where('isActive', true).whereNull('deletedAt').first('id');
-
-  return division?.id || null;
 }
 
 async function insertRequestDetails(trx, requestId, details, now) {
